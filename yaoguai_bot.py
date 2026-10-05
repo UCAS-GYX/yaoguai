@@ -649,8 +649,8 @@ def build_room(cv):
         rows = parse_build_panel(texts)
         gen, cat = rows.get("gen"), rows.get("cat")
         if gen:
-            BATTLE["gens"] = gen["n"]
-        want = (("gen", gen) if gen and gen["n"] < min(gen["m"], MAX_GENS) else
+            BATTLE["gens"], BATTLE["gen_max"] = gen["n"], gen["m"]   # 上限以面板为准（房间研发后 2 → 3）
+        want = (("gen", gen) if gen and gen["n"] < gen["m"] else
                 ("cat", cat) if cat and cat["n"] < cat["m"] else None)
         if want is None:
             BATTLE["build_done"] = True
@@ -1321,7 +1321,7 @@ def battle_round(cv, n, t0, summon_every):
     if END_SEEN[0]:
         return
     door_stuck = "资源不足" in (dt or "") or (dt == "无箭头" and BATTLE.get("door_lv", 0) >= 6 and not BATTLE.get("door_max"))
-    gens_full = BATTLE.get("gens", 0) >= MAX_GENS             # 发电机满了 => 有电就建招财猫（+10 金/秒）
+    gens_full = BATTLE.get("gens", 0) >= BATTLE.get("gen_max", MAX_GENS)   # 发电机满了 => 有电就建招财猫（+10 金/秒）
     if AUTO_BUILD and ((door_stuck and (coins or 0) >= 350) or gens_full):
         build_room(cv)
     hp = BATTLE.get("door_hp", 1.0)
