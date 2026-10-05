@@ -972,13 +972,16 @@ LOSE_WORDS = ("失败", "再接再厉", "被攻破", "重新挑战", "再来一�
 
 
 def classify_end(texts):
-    j = ocr_join(texts).replace("升级成功", "").replace("召唤成功", "").replace("双倍奖励仅有", "")
+    raw = ocr_join(texts)
+    j = raw.replace("升级成功", "").replace("召唤成功", "").replace("双倍奖励仅有", "")
     if any(k in j for k in ("上传失败", "离开房间", "网络", "重连")):
         return "中断"
     if any(k in j for k in LOSE_WORDS):
         return "负"
     if any(k in j for k in WIN_WORDS):
         return "胜"
+    if re.search(r"通关双倍奖励|领取双倍奖励|双倍奖励仅有", raw):
+        return "胜"                                    # 双倍奖励确认框只在通关后出现（17:49 第 81 关因此被记成「结束」，研发没触发）
     return None
 
 
@@ -1695,9 +1698,14 @@ def to_next_battle(cv, st, timeout=150):
             clicked = click_text(cv, texts, ("返回",), 0.05)          # 结算画面 => 返回
         elif "恭喜获得" in j:
             cv.click("nav_blank", 0.05, "奖励弹窗：点空白关闭"); clicked = True
-        elif ("请领取奖励" in j or "已通关" in j) and chest_clicks < 3:
+        elif ("请领取奖励" in j or "已通关" in j) and chest_clicks < 6:
             chest_clicks += 1
-            cv.click("chest", 0.05, "主页（已通关）：点宝箱领通关奖励"); clicked = True
+            if chest_clicks % 2:                       # 宝箱图标 / 底部「已通关 请领取奖励」按钮轮流点（17:49 重启后点宝箱没反应，卡了 2 分钟）
+                cv.click("chest", 0.05, "主页（已通关）：点宝箱领通关奖励")
+            else:
+                POSITIONS["_c"] = _find(texts, ("请领取奖励", "已通关"), 0.8) or POSITIONS["start"]
+                cv.click("_c", 0.05, f"主页（已通关）：点「已通关 请领取奖励」按钮 {POSITIONS['_c']}")
+            clicked = True
         elif sc == "home" and research_due(st):
             do_research(cv, st); unknown = 0; ladder = 0; sig_t = time.time(); continue
         elif sc == "home":

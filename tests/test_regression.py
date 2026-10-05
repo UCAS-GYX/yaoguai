@@ -125,6 +125,8 @@ class Texts(unittest.TestCase):
         self.assertEqual(yb.classify_end(T("挑战失败", "再接再厉")), "负")
         self.assertIsNone(yb.classify_end(T("升级成功", "召唤")))
         self.assertTrue(yb.is_end_screen(T("每关通关双倍奖励仅有1次领取机会")))
+        # 17:49 第 81 关：只看到双倍奖励确认框（没看到「挑战成功」）=> 也是胜
+        self.assertEqual(yb.classify_end(T("提示", "每关通关双倍奖励仅有1次领取机", "会，是否前往领取双倍奖励", "放弃")), "胜")
 
     def test_double_reward_not_promo(self):
         self.assertFalse(yb.is_promo(T("前往领取双倍", "放弃")))
