@@ -70,6 +70,9 @@ SPEED_2X = False            # 左上「X1」倍速按钮：用户 16:50 确认�
 IDLE_COINS = 2000           # 金币 ≥ 2000 时每轮额外召唤 1 次（≥ 8000 召唤 2 次）；价格变红时 summon() 会自己跳过
 RESTART_EVERY = 5           # 每打完 5 关重启一次后台浏览器（游戏页越跑越重：97 分钟后渲染进程 202% CPU / 2.8 GB）
 RESTART_RSS_MB = 1800       # 没到 5 关但渲染进程内存超过 1.8 GB 也重启
+SLOW_RATIO = 1.6            # 游戏时钟走速：墙钟/游戏 > 1.6（游戏 < 墙钟 60%）算一轮“变慢”（L69：640 秒墙钟游戏才 03:26）
+SLOW_ROUNDS = 2             # 连续 2 轮变慢 => 记「游戏变慢」，本关结束后立即重启后台浏览器（不在战斗中途重启）
+OPENING_WAIT = 30           # 开局最多等多少秒确认暂停按钮（开局「等待加入/N秒后」倒计时期间不点空白）
 SPEED_POS = (0.069, 0.304)  # 「X1」按钮位置（暂停按钮正下方）
 CALIB_FILE = "calib_cdp.json"   # CDP 版：画布位置是网页内 CSS 像素（旧版整屏坐标在 calib.json，不再使用）
 LOG_FILE = "battle_log.csv"
@@ -841,11 +844,41 @@ def game_ui(cv, img=None, texts=None):
     return looks_home(texts)
 
 
-def clear_popups(cv, tries=3):
+POPUP_CUES = ("点击空白处", "点击任意位置", "观影免费", "刷新（", "恭喜获得", "精英", "掉落")
+PAUSED_RE = re.compile(r"[暂質哲百西五]?停中|暂停")   # OCR 常把「暂停中」认成「百停中/質停中/西停中」
+OPENING = [False]           # play_battle 开局阶段：clear_popups 没看到弹窗文字就不盲点空白
+
+
+def popup_cue(texts):
+    """画面上有战斗弹窗（转盘/掉落/升星等）的文字。开局「等待加入/N秒后」倒计时没有这些字。"""
+    j = ocr_join(texts)
+    return any(k in j for k in POPUP_CUES) or bool(PAUSED_RE.search(j))
+
+
+def _paused(sec):
+    """选卡/弹窗期间游戏暂停：累计暂停的墙钟秒数，游戏时钟走速检测（pace_sample）要扣掉"""
+    if sec > 0:
+        BATTLE["paused_s"] = BATTLE.get("paused_s", 0.0) + sec
+
+
+def clear_popups(cv, tries=3, blind=None):
     """战斗中出现转盘/精英掉落/盲盒等弹窗时（暂停按钮被遮住），点空白处关闭。
-    返回 True 表示已回到战斗画面。注意空白处避开弹窗底部的「观影免费/刷新」按钮。"""
+    返回 True 表示已回到战斗画面。注意空白处避开弹窗底部的「观影免费/刷新」按钮。
+    blind=False（开局阶段默认）：画面上没有弹窗文字（popup_cue）时只等不点。"""
+    img = cv.grab()
+    if cv.in_battle(img):
+        return True
+    t0 = time.time()
+    try:
+        return _clear_popups(cv, tries, (not OPENING[0]) if blind is None else blind, img)
+    finally:
+        _paused(time.time() - t0)
+
+
+def _clear_popups(cv, tries, blind, img):
     for i in range(tries):
-        img = cv.grab()
+        if i:
+            img = cv.grab()
         if cv.in_battle(img):
             return True
         if END_SEEN[0]:
@@ -864,8 +897,13 @@ def clear_popups(cv, tries=3):
         if "随机事件" in ocr_join(texts):
             cv.click("top_mask", 0.05, "随机事件弹窗：点上方遮罩关闭（不点免费/视频）")
             cv.wait_changed(img, 1.5); continue
-        if not close_info(cv, texts):
+        if close_info(cv, texts):
+            pass
+        elif blind or popup_cue(texts):
             cv.click("blank", 0.05, "检测到弹窗（转盘/掉落等），点击空白处关闭" if i == 0 else "")
+        else:
+            time.sleep(0.5)                            # 开局倒计时/过场：没有弹窗文字 => 不点空白，等它自己消失
+            continue
         cv.wait_changed(img, 1.5)
     return cv.in_battle()
 
@@ -949,6 +987,62 @@ def read_coins(texts):
         if 0.08 <= x <= 0.22 and 0.18 <= y <= 0.23 and re.fullmatch(r"\d{1,7}", t.strip()):
             return int(t)
     return None
+
+
+def read_price(texts):
+    """「召唤」按钮上方的价格数字（POSITIONS["price"] ≈ (0.50, 0.91)；左边的「7折」等不是价格）"""
+    fx, fy = POSITIONS["price"]
+    for t, x, y in texts:
+        if abs(x - fx) <= 0.08 and abs(y - fy) <= 0.03 and re.fullmatch(r"\d{1,6}", t.strip()):
+            return int(t.strip())
+    return None
+
+
+CLOCK_RE = re.compile(r"(\d{2}):(\d{2})(?!\d)")   # 不限制左边：图标会被认成前缀数字
+
+
+def read_game_clock(texts):
+    """战斗画面顶部的游戏计时（和「第N关」同一行，右侧，形如「02:16」）=> 秒数；读不到返回 None。
+    OCR 常把计时左边的图标认成数字：「402:16」「2703:27」，所以只取最后两位分钟。"""
+    for t, x, y in texts:
+        if y > 0.2:
+            continue
+        m = CLOCK_RE.search(t.replace("：", ":"))
+        if m and int(m.group(2)) < 60:
+            return int(m.group(1)) * 60 + int(m.group(2))
+    return None
+
+
+def clock_paused(texts):
+    """顶部计时旁边出现「暂停中」（OCR 常认成「百停中/質停中」）"""
+    return any(y <= 0.2 and PAUSED_RE.search(t) for t, x, y in texts)
+
+
+def clock_pace(samples, ratio=SLOW_RATIO, min_wall=8.0):
+    """samples = [(墙钟秒数（已扣掉选卡/弹窗暂停）, 游戏秒数或 None, 是否暂停中)]，按时间顺序。
+    返回 (末尾连续“变慢”的轮数, 最后一段的 墙钟/游戏 比值或 None)。
+    - 读不到计时的样本跳过；暂停中的样本只当作新的起点（暂停期间游戏时钟本来就不走）
+    - 游戏时钟倒退或比墙钟快很多（读错/页面重载）=> 重新起算，连续计数清零"""
+    streak, last, base = 0, None, None
+    for w, g, p in samples:
+        if g is None:
+            continue
+        if p:
+            base = (w, g)
+            continue
+        if base is None:
+            base = (w, g)
+            continue
+        dw, dg = w - base[0], g - base[1]
+        if dw < min_wall:
+            continue                                   # 间隔太短，等下一个样本再比
+        if dg < 0 or dg > dw * 1.3 + 5:
+            base, streak, last = (w, g), 0, None
+            continue
+        last = dw / dg if dg > 0 else float("inf")
+        streak = streak + 1 if last > ratio else 0
+        base = (w, g)
+    return streak, last
 
 
 ALERT_STOP = ("其他地方登", "重新登录", "登录失效", "请登录", "请上阵5个神将", "请上阵5个")
@@ -1204,15 +1298,31 @@ def focus_browser():
     wait_game_visible()
 
 
+def summon_blocked(cv):
+    """召唤前确认钱够：OCR 读左上金币和「召唤」上方价格，金币 < 价格 => 返回原因（跳过召唤）。
+    两个数都读到且钱够 => None；读不到 => 沿用 price_is_red（价格变红）。CHECK_PRICE_RED=False 时不检测。"""
+    if not CHECK_PRICE_RED:
+        return None
+    texts = cv.ocr(tag="price")
+    coins, price = read_coins(texts), read_price(texts)
+    BATTLE["last_cp"] = (coins, price)
+    if coins is not None and price is not None:
+        return f"金币 {coins} < 价格 {price}" if coins < price else None
+    return "召唤价格为红色" if cv.price_is_red() else None
+
+
 def summon(cv):
     if not clear_popups(cv):
         return
-    if CHECK_PRICE_RED and cv.price_is_red():
-        log("召唤价格为红色（金币不足），跳过召唤")
+    why = summon_blocked(cv)
+    if why:
+        log(f"{why}（金币不足），跳过召唤")
         return
     cv.click("summon", 1.2, "召唤")
     BATTLE["summons"] += 1
-    pick_card(cv)
+    if not pick_card(cv):
+        c, p = BATTLE.get("last_cp", (None, None))
+        log(f"  （召唤前读数：金币 {c}，价格 {p}）")
 
 
 def picker_open(texts):
@@ -1221,6 +1331,15 @@ def picker_open(texts):
 
 
 def pick_card(cv):
+    """选卡期间游戏暂停：用时记进 BATTLE["paused_s"]（游戏时钟走速检测要扣掉）"""
+    t0 = time.time()
+    try:
+        return _pick_card(cv)
+    finally:
+        _paused(time.time() - t0)
+
+
+def _pick_card(cv):
     """选卡界面（「请点击选择上方任一选项」，1~3 张卡）：依次试 3 张卡时第 1 张 / 2 张卡时第 1 张 / 1 张卡（居中），
     每点一次都用 OCR 确认选卡界面是否关闭。"""
     t = cv.ocr(tag="pick")
@@ -1266,7 +1385,30 @@ BATTLE = {"level": None, "summons": 0, "end_texts": ""}
 
 def reset_battle(level):
     BATTLE.clear()
-    BATTLE.update(level=level, summons=0, end_texts="", gens=0, bad_tiles=[], gen_labels=[], bed_pos=None)
+    BATTLE.update(level=level, summons=0, end_texts="", gens=0, bad_tiles=[], gen_labels=[], bed_pos=None,
+                  paused_s=0.0, pace=[])
+
+
+SLOW_FLAG = [False]          # 本关游戏时钟明显变慢（卡死前兆）=> periodic_restart 在关卡间隙立即重启后台浏览器
+
+
+def pace_sample(texts, now=None):
+    """battle_round 每轮调用：记录 (墙钟-暂停, 游戏秒数, 暂停中)，连续 SLOW_ROUNDS 轮走速 < 墙钟 1/SLOW_RATIO => 置 SLOW_FLAG。
+    返回 (游戏秒数, 最后一段比值)。只记日志/置标记，不在战斗中途做任何恢复动作。"""
+    now = time.time() if now is None else now
+    g = read_game_clock(texts)
+    pace = BATTLE.setdefault("pace", [])
+    pace.append((now - BATTLE.get("paused_s", 0.0), g, clock_paused(texts)))
+    del pace[:-12]
+    streak, r = clock_pace(pace)
+    if streak >= SLOW_ROUNDS and not BATTLE.get("slow"):
+        BATTLE["slow"] = True
+        SLOW_FLAG[0] = True
+        clk = f"{g // 60:02d}:{g % 60:02d}" if g is not None else "?"
+        log(f"游戏变慢：游戏时钟连续 {streak} 轮走速不到墙钟的 {1 / SLOW_RATIO:.0%}（墙钟/游戏 = {r:.1f}，游戏计时 "
+            f"{clk}），本关结束后重启后台浏览器")
+        event("slow_game", None, extra=f"ratio={r:.2f} streak={streak} clock={g}")
+    return g, r
 
 
 AUTO_BUILD = True            # 门升不动（资源不足=缺电）且金币够时，自动建发电机
@@ -1300,6 +1442,7 @@ def battle_round(cv, n, t0, summon_every):
     if lv:
         BATTLE["level"] = lv
     coins = read_coins(texts)
+    gclk, gr = pace_sample(texts)                      # 游戏时钟走速（卡死前兆）：只记录/置标记
     dt = ""
     nd = BATTLE.get("need")
     if nd and BATTLE.get(nd[1] + "_lv", 0) >= nd[2]:
@@ -1358,6 +1501,8 @@ def battle_round(cv, n, t0, summon_every):
         explore_build(cv)
     dw = BATTLE.get("dw", {})
     dbs = (f"，门血条 {dw['ratio']:.0%}" if dw.get("ratio") is not None else "") + ("，防守中" if dw.get("mode") else "")
+    if gclk is not None:
+        dbs += f"，游戏计时 {gclk // 60:02d}:{gclk % 60:02d}" + (f"（墙钟/游戏 {gr:.2f}）" if gr else "")
     log(f"战斗进行中……第 {BATTLE['level']} 关，已 {int(time.time() - t0)} 秒，金币 {coins}，召唤 {BATTLE['summons']} 次{dbs}")
 
 
@@ -1396,6 +1541,7 @@ def wait_battle(cv, t0, summon_every=SUMMON_EVERY):
             if pop_ev is not None:
                 event("popup", cv, pop_ev, shot=False); pop_ev = None
             if popup_t:
+                _paused(time.time() - popup_t)         # 弹窗期间游戏暂停（时钟走速检测扣掉）
                 log(f"弹窗已关闭，从出现到关闭用时 {time.time() - popup_t:.1f} 秒（点空白 {blanks} 次）")
                 popup_t, blanks = None, 0
                 door_watch_pause(1.0)                  # 弹窗淡出动画期间不读门血条
@@ -1515,18 +1661,51 @@ def explore_build(cv):
     save_shot(cv, "buildclose")
 
 
+def opening_wait(cv, timeout=OPENING_WAIT, need=1):
+    """开局：等左上红色暂停按钮连续 need 次可见（= 真的在战斗中）。开局「等待加入 / N秒后…」倒计时期间暂停按钮被遮住，
+    但画面上没有弹窗文字 => 只等不点（以前 clear_popups 盲点空白，平均每关开局点 4.3 次、第一次升级晚 25 秒）。
+    看到弹窗文字/选卡/结算才处理；超时仍没进战斗 => 退回旧办法（点一次空白）。返回是否在战斗中。"""
+    t, seen, n_ocr = time.time(), 0, 0
+    while time.time() - t < timeout:
+        if END_SEEN[0]:
+            return False
+        img = cv.grab()
+        if cv.in_battle(img):
+            seen += 1
+            if seen >= need:
+                return True
+            time.sleep(0.5)
+            continue
+        seen = 0
+        n_ocr += 1
+        texts = cv.ocr(img, tag="popup") if n_ocr % 2 == 1 else []   # 每 2 次才 OCR，平时只看暂停按钮像素
+        if is_end_screen(texts):
+            END_SEEN[0] = True
+            return False
+        if texts and (popup_cue(texts) or picker_open(texts) or is_promo(texts) or "随机事件" in ocr_join(texts)):
+            clear_popups(cv, tries=1, blind=False)     # 真弹窗：按原规则关
+            continue
+        time.sleep(0.5)
+    log(f"开局：{timeout:.0f} 秒没确认到暂停按钮，按旧办法点空白")
+    return clear_popups(cv, blind=True)
+
+
 def play_battle(cv, t0, opening=True, summon_every=SUMMON_EVERY):
     if opening:
         log("开局：升床 + 升门 + 召唤")
-        sleep(3)
-        try_speed_2x(cv)
-        for _ in range(EARLY_BED_TRIES):
-            bed_upgrade(cv)
-        for _ in range(EARLY_DOOR_TRIES):
-            door_upgrade(cv)
-        for _ in range(EARLY_SUMMONS):
-            summon(cv)
-            clear_popups(cv)
+        OPENING[0] = True
+        try:
+            ok = opening_wait(cv, need=3)              # 原来固定 sleep(3) 后直接升级（倒计时中盲点空白）
+            log(f"开局：{'已确认在战斗中' if ok else '未确认战斗画面'}（开局后 {time.time() - t0:.1f} 秒）")
+            try_speed_2x(cv)
+            steps = [bed_upgrade] * EARLY_BED_TRIES + [door_upgrade] * EARLY_DOOR_TRIES + [summon] * EARLY_SUMMONS
+            for fn in steps:
+                if END_SEEN[0]:
+                    break
+                ok = opening_wait(cv, timeout=8 if ok else 3)   # 每步之前确认还在战斗中（不点空白）
+                fn(cv)
+        finally:
+            OPENING[0] = False
     return wait_battle(cv, t0, summon_every)
 
 
@@ -2079,8 +2258,10 @@ BROWSER_LEVELS = [0]        # 当前这个后台浏览器打了几关（finish_l
 def periodic_restart():
     """关卡间隙：打满 RESTART_EVERY 关，或渲染进程内存超过 RESTART_RSS_MB，就重启后台浏览器（约 10–30 秒，登录不丢）"""
     cpu, mb = cdp_backend.renderer_stats()
-    why = (f"已打 {BROWSER_LEVELS[0]} 关" if BROWSER_LEVELS[0] >= RESTART_EVERY else
+    why = ("上一关游戏变慢（卡死前兆）" if SLOW_FLAG[0] else
+           f"已打 {BROWSER_LEVELS[0]} 关" if BROWSER_LEVELS[0] >= RESTART_EVERY else
            f"渲染进程内存 {mb} MB" if mb >= RESTART_RSS_MB else None)
+    SLOW_FLAG[0] = False                               # 只触发一次（重启失败也不反复重启）
     if not why:
         if BROWSER_LEVELS[0]:
             log(f"后台浏览器负载：渲染进程 CPU {cpu:.0f}%、内存 {mb} MB（已打 {BROWSER_LEVELS[0]} 关，满 {RESTART_EVERY} 关重启）")
