@@ -659,7 +659,11 @@ def build_room(cv):
         if gen:
             BATTLE["gens"], BATTLE["gen_max"] = gen["n"], gen["m"]   # 上限以面板为准（房间研发后 2 → 3）
         want = (("gen", gen) if gen and gen["n"] < gen["m"] else
-                ("cat", cat) if cat and cat["n"] < cat["m"] else None)
+                ("cat", cat) if cat and cat["n"] < cat["m"] and not skill_reserve() else None)
+        if want is None and cat and cat["n"] < cat["m"]:       # 只是给道法留电：关面板，过一会儿再来
+            cv.click("blank", 0.6)
+            log("精英/Boss 快来了，电留给道法，这次先不建招财猫")
+            return
         if want is None:
             BATTLE["build_done"] = True
             cv.click("blank", 0.6)
@@ -1473,7 +1477,8 @@ def battle_round(cv, n, t0, summon_every):
         return
     door_stuck = "资源不足" in (dt or "") or (dt == "无箭头" and BATTLE.get("door_lv", 0) >= 6 and not BATTLE.get("door_max"))
     gens_full = BATTLE.get("gens", 0) >= BATTLE.get("gen_max", MAX_GENS)   # 发电机满了 => 有电就建招财猫（+10 金/秒）
-    if AUTO_BUILD and ((door_stuck and (coins or 0) >= 350) or gens_full):
+    early_gen = SKILLS and BATTLE.get("gens", 0) < 1 and (coins or 0) >= 350   # 第 90 关：精英 1 来时只有 30 电，道法要 60+
+    if AUTO_BUILD and ((door_stuck and (coins or 0) >= 350) or gens_full or early_gen):
         build_room(cv)
     hp = BATTLE.get("door_hp", 1.0)
     br = BATTLE.get("dw", {}).get("ratio")
@@ -1504,6 +1509,173 @@ def battle_round(cv, n, t0, summon_every):
     if gclk is not None:
         dbs += f"，游戏计时 {gclk // 60:02d}:{gclk % 60:02d}" + (f"（墙钟/游戏 {gr:.2f}）" if gr else "")
     log(f"战斗进行中……第 {BATTLE['level']} 关，已 {int(time.time() - t0)} 秒，金币 {coins}，召唤 {BATTLE['summons']} 次{dbs}")
+
+
+# ---------------- 道法 / 召唤兽（第 86 关以后有精英和 Boss）----------------
+# 用户规则：精英（有血条，前 3 个）靠近时点右下「道法」；最后的 Boss（第 4 个）靠近时点「道法」，
+# 再点左下「召唤兽」并拖到 Boss 身上（召唤兽每关只有 1 次，只给 Boss）。来的时候没有提示。
+# 19:05 第 89 关录像：顶部进度条橙色填充从 x≈0.14 匀速走到 0.69（约 290 秒），然后停住直到 Boss 被打死；
+# 进度条上 3 个精英标记约在 0.29 / 0.43 / 0.57，Boss 标记在末端。填充越过标记 = 这只怪出场，之后再等它走近。
+SKILLS = True
+ELITE_MARKS = (0.29, 0.43, 0.57)
+BOSS_MARK = 0.68
+ELITE_DELAY = 12            # 精英出场后多少秒放道法（或门开始掉血时立刻放）
+BOSS_DELAY = 15             # Boss 出场后多少秒放道法 + 召唤兽
+DAOFA_POS = (0.910, 0.875)  # 右下「道法」图标（价格数字在 (0.928,0.908)，实测 60→80 会涨）
+BEAST_POS = (0.085, 0.845)  # 左下「召唤兽」图标（文字在 (0.085,0.880)）
+
+
+def read_progress(img):
+    """顶部进度条橙色填充的右端（画布比例 x）；读不到返回 None"""
+    sm = img.convert("RGB").resize((391, int(391 * img.height / img.width))); w, h = sm.size; px = sm.load()
+    best = None
+    for y in range(int(0.12 * h), int(0.165 * h)):
+        xs = [x for x in range(int(0.10 * w), int(0.75 * w))
+              if px[x, y][0] >= 200 and 110 <= px[x, y][1] <= 200 and px[x, y][2] <= 90]
+        if xs and min(xs) < 0.17 * w and (best is None or len(xs) > len(best)):
+            best = xs
+    return round(max(best) / w, 3) if best and len(best) >= 4 else None
+
+
+def read_power(texts):
+    """战斗画面左上「电」数字（闪电图标右侧，约 (0.40, 0.207)）"""
+    for t, x, y in texts:
+        if 0.33 <= x <= 0.48 and 0.19 <= y <= 0.23 and re.fullmatch(r"\d{1,4}", t.strip()):
+            v = int(t)
+            return v if v <= 3000 else None            # 19:42 / 19:46 把飘字连进来读成 26827、20146，误判「放成」
+    return None
+
+
+def _sk():
+    return BATTLE.setdefault("sk", {"prev": None, "seen": set(), "pending": [], "boss": False, "beast": False,
+                                    "next": 0.0, "casts": 0})
+
+
+def skill_reserve():
+    """有精英/Boss 快来或已出场没放技能 => 先别把电花在招财猫上（道法要 60–80 电）"""
+    if not SKILLS:
+        return False
+    s = _sk()
+    f = s["prev"]
+    if s["pending"]:
+        return True
+    return f is not None and any(0 < m - f < 0.05 for m in ELITE_MARKS + (BOSS_MARK,))
+
+
+def skill_tick(cv, img):
+    """战斗中每秒调用：看进度条有没有越过精英/Boss 标记，到时间（或门开始掉血）就放技能"""
+    if not SKILLS:
+        return
+    s = _sk(); now = time.time()
+    if now < s["next"]:
+        return
+    s["next"] = now + 1.0
+    f = read_progress(img)
+    if f is None:
+        return
+    p = s["prev"]
+    if p is not None and f >= p - 0.01:                # 进度条只往前走；开局倒计时时是满的，第一次读数只记不触发
+        for i, m in enumerate(ELITE_MARKS):
+            if i not in s["seen"] and p < m <= f:
+                s["seen"].add(i); s["pending"].append(("elite", i + 1, now))
+                log(f"精英 {i + 1} 出场（进度条 {f:.2f} 越过 {m}），{ELITE_DELAY} 秒后或门掉血时放道法")
+                event("elite", cv, extra=f"#{i + 1} prog={f}")
+        if not s["boss"] and p < BOSS_MARK <= f:
+            s["boss"] = True; s["pending"].append(("boss", 4, now))
+            log(f"Boss 出场（进度条 {f:.2f}），{BOSS_DELAY} 秒后或门掉血时放道法 + 召唤兽")
+            event("boss", cv, extra=f"prog={f}")
+    s["prev"] = f
+    if not s["pending"]:
+        return
+    it = s["pending"][0]
+    kind, n, t = it[0], it[1], it[2]
+    hurt = (_dw().get("ratio") or 1.0) < 0.97
+    age = now - t
+    if age < (BOSS_DELAY if kind == "boss" else ELITE_DELAY) and not hurt:
+        return
+    why = f"{'Boss' if kind == 'boss' else f'精英 {n}'}{'（门在掉血）' if hurt else ''}"
+    # 19:26 第 90 关实测：点了道法但电不扣——电不够（「电量不足」）或怪还没进射程。所以到时间后每 4 秒试一次，
+    # 电真的扣了才算放成；精英最多试 70 秒，Boss 最多 150 秒
+    if now >= s.get("retry_at", 0):
+        s["retry_at"] = now + 4
+        ok = cast_daofa(cv, why)
+        if ok or age > (150 if kind == "boss" else 70):
+            s["pending"].pop(0); s["retry_at"] = 0
+            if not ok:
+                log(f"{why}：道法 {age:.0f} 秒内没放成，放弃这只")
+    # 召唤兽每关 1 次：Boss 道法放成之后，或 Boss 出场 45 秒还没放成但门在掉血 / 已 60 秒，就拖过去
+    if kind == "boss" and not s["beast"] and (s["pending"] == [] or (age > 45 and hurt) or age > 60):
+        s["beast"] = True
+        use_beast(cv, why)
+    door_watch_pause(1.5)
+
+
+def read_daofa_cost(texts):
+    """道法图标下方的价格（约 (0.928, 0.908)，60 → 80 会涨）"""
+    for t, x, y in texts:
+        if x >= 0.86 and 0.88 <= y <= 0.935 and re.fullmatch(r"\d{2,4}", t.strip()):
+            return int(t)
+    return None
+
+
+def cast_daofa(cv, why):
+    """点道法；电真的扣了（≥ 20）才算放成。电不够就不点，返回 False"""
+    t0 = cv.ocr(tag="skill")
+    pw, cost = read_power(t0), read_daofa_cost(t0)
+    if pw is not None and cost and pw < cost:
+        log(f"道法（{why}）：电 {pw} < {cost}，等电")
+        return False
+    POSITIONS["_s"] = DAOFA_POS
+    cv.click("_s", 1.0)
+    t1 = cv.ocr(tag="skill")
+    pw2 = read_power(t1)
+    j1 = ocr_join(t1)
+    ok = pw is not None and pw2 is not None and pw - pw2 >= 20
+    _sk()["casts"] += 1
+    note = "放成" if ok else ("电量不足" if "电量不足" in j1 else "电没扣（怪可能还没进射程）")
+    log(f"道法（{why}）：电 {pw} → {pw2}，价格 {cost}，{note}")
+    event("daofa", cv, t1, shot=ok, extra=f"{why} power {pw}->{pw2} cost {cost} {note}")
+    if not cv.in_battle():                             # 万一弹出了面板（选道法等）
+        log(f"  道法后画面：{j1[:100]}")
+    return ok
+
+
+def beast_target(cv, img=None):
+    """召唤兽拖到哪：门附近最低（离门最近）的那条红色血条；找不到就拖到门正上方"""
+    img = img or cv.grab()
+    sm = img.convert("RGB").resize((391, int(391 * img.height / img.width))); w, h = sm.size; px = sm.load()
+    g = _dw().get("geo") or door_bar_locate(img)
+    dy = (g["y0"] if g else 0.56)
+    best = None
+    for y in range(int(0.20 * h), int(dy * h) - 4):
+        run = 0
+        for x in range(int(0.12 * w), int(0.74 * w)):
+            p = px[x, y]
+            if p[0] >= 170 and p[1] <= 90 and p[2] <= 90:
+                run += 1
+                continue
+            if run >= 14 and (best is None or y > best[1]):
+                best = ((x - run / 2) / w, y / h)
+            run = 0
+    if best:
+        return (best[0], min(dy - 0.02, best[1] + 0.04)), "血条"
+    cx = ((g["x0"] + g["x1"]) / 2) if g else 0.36
+    return (cx, dy - 0.06), "门上方"
+
+
+def use_beast(cv, why):
+    img = cv.grab()
+    (tx, ty), how = beast_target(cv, img)
+    c = cv.c
+    ax, ay = c["left"] + BEAST_POS[0] * c["width"], c["top"] + BEAST_POS[1] * c["height"]
+    bx, by = c["left"] + tx * c["width"], c["top"] + ty * c["height"]
+    log(f"召唤兽（{why}）：从左下图标拖到 ({tx:.2f},{ty:.2f})（{how}）")
+    BR.drag(ax, ay, bx, by)
+    time.sleep(1.0)
+    t = cv.ocr(tag="skill")
+    event("beast", cv, t, shot=True, extra=f"{why} -> ({tx:.2f},{ty:.2f}) {how}")
+    if not cv.in_battle():
+        log(f"  召唤兽后画面：{ocr_join(t)[:100]}")
 
 
 def restore_battle_fullscreen(cv):
@@ -1552,6 +1724,7 @@ def wait_battle(cv, t0, summon_every=SUMMON_EVERY):
                 next_round = time.time() + LOOP_INTERVAL
                 continue
             door_watch(cv, img)                        # 门血条 + 防守模式召唤
+            skill_tick(cv, img)                        # 精英/Boss 出场 => 道法 / 召唤兽
             continue
         # 暂停按钮不见了：转盘/掉落弹窗，或者结算画面
         if embedded_page([]) and restore_battle_fullscreen(cv):

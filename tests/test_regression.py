@@ -161,6 +161,20 @@ class Texts(unittest.TestCase):
         t = [("房间研发", 0.50, 0.12), ("52", 0.08, 0.30), ("51", 0.08, 0.43), ("48", 0.08, 0.85), ("键升级", 0.52, 0.96)]
         self.assertEqual(yb._research_levels(t), [48, 51, 52])
 
+    def test_progress_bar(self):
+        """第 89 关录像：进度条 Boss 阶段停在约 0.69"""
+        f = yb.read_progress(img("progress_191242.png"))
+        self.assertIsNotNone(f)
+        self.assertAlmostEqual(f, 0.69, delta=0.02)
+        self.assertGreater(yb.read_progress(img("progress_191242.png")), yb.BOSS_MARK)
+
+    def test_power_and_daofa_cost(self):
+        t = [("2831", 0.140, 0.207), ("126", 0.401, 0.207), ("80", 0.928, 0.908), ("320", 0.532, 0.912)]
+        self.assertEqual(yb.read_power(t), 126)
+        self.assertEqual(yb.read_daofa_cost(t), 80)              # 不能把召唤价格 320 当成道法价格
+        self.assertIsNone(yb.read_power([("20146", 0.40, 0.207)]))  # 飘字连读，不能当电量（否则误判道法放成）
+        self.assertIsNone(yb.read_power([("26827", 0.40, 0.207)]))
+
     def test_read_level(self):
         self.assertEqual(yb.read_level([("第 64 关", 0.1, 0.1)]), 64)
         self.assertIsNone(yb.read_level([("勞67夫", 0.1, 0.1)]))

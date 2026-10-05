@@ -300,6 +300,20 @@ class Browser:
         time.sleep(0.1)
         self.call("Input.dispatchMouseEvent", type="mouseReleased", x=x, y=y, button="left", clickCount=1)
 
+    def drag(self, x0, y0, x1, y1, steps=14, dur=0.6):
+        """按住 (x0,y0) 拖到 (x1,y1) 再松开（CSS 像素）。召唤兽要拖到 Boss 身上"""
+        self.call("Input.dispatchMouseEvent", type="mouseMoved", x=x0, y=y0)
+        time.sleep(0.05)
+        self.call("Input.dispatchMouseEvent", type="mousePressed", x=x0, y=y0, button="left", buttons=1, clickCount=1)
+        time.sleep(0.15)
+        for i in range(1, steps + 1):
+            k = i / steps
+            self.call("Input.dispatchMouseEvent", type="mouseMoved", x=x0 + (x1 - x0) * k, y=y0 + (y1 - y0) * k,
+                      button="left", buttons=1)
+            time.sleep(dur / steps)
+        time.sleep(0.15)
+        self.call("Input.dispatchMouseEvent", type="mouseReleased", x=x1, y=y1, button="left", buttons=0, clickCount=1)
+
     def url(self):
         return self.js("location.href") or ""
 
