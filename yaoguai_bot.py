@@ -10,13 +10,17 @@
 停止: kill 进程 / 终端里 Ctrl+C
 登录过期: ./venv/bin/python cdp_qr_login.py 扫码
 """
-import collections, csv, json, os, re, signal, subprocess, sys, time, threading
+import collections, csv, json, os, re, signal, sys, time, threading
 from datetime import datetime
 
 import warnings
 import cdp_backend
+import notify
+import ocr_client
+import vision
+from vision import find_arrows, find_door, parse_prereq, door_bar_locate, door_bar_measure, DB_W
 warnings.filterwarnings("ignore", category=DeprecationWarning)
-from PIL import Image, ImageChops, ImageDraw, ImageStat
+from PIL import Image, ImageChops, ImageStat
 
 # ======================= 可调参数 =======================
 # 所有坐标均为相对游戏画布的比例 (0..1)，由 1280x800 屏幕上画布 x466..813, y94..795 换算得出
@@ -271,7 +275,7 @@ class Canvas:
             if img.width < 600:                        # 1 倍截图（约 397 宽）先放大 2 倍再识别，小字「4级」/价格更准
                 img = img.resize((img.width * 2, img.height * 2), Image.LANCZOS)
             path = os.path.join(HERE, f"_{tag}.png"); img.save(path)
-            out = subprocess.run([exe, path], capture_output=True, text=True, timeout=8).stdout
+            out = ocr_client.ocr_text(path, 8)          # 常驻 OCR 进程（约 0.17 s/次，原每次启动进程约 0.32 s）
             body = "\n".join(l for l in out.splitlines() if not re.match(r"^\s*[\dPEC-]{6,}|^.*huntu", l))  # 去掉游戏底部版本号行
             page_check(body)                           # 淘宝网页/崩溃页文字 => 标记，由导航/战斗循环做恢复
             m_ov = re.search(r"(?<![\d.])\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(?![\d.])|https?:|\.com|GitLab|个账号|mail\.", body)
@@ -316,79 +320,8 @@ PANEL_KEY = {"door": "大门", "bed": "床铺"}
 
 
 def find_bed(texts):
-    """床的位置每关不同：找房间下半部的「N级」标签（床下方的等级字），返回点击点"""
-    best = None
-    for t, x, y in texts:
-        if re.fullmatch(r"\d{1,2}级", t.strip()) and 0.64 <= y <= 0.88:
-            if any(abs(x - gx) < 0.05 and abs(y - gy) < 0.05 for gx, gy in BATTLE.get("gen_labels", [])):
-                continue                               # 发电机的等级标签
-            d = (x - 0.72) ** 2 + (y - 0.78) ** 2
-            if best is None or d < best[0]:
-                best = (d, x, y)
-    return None if best is None else (best[1] - 0.02, best[2] - 0.03)
-
-
-def parse_prereq(text):
-    """面板里的「前置：N级大门」/「大门达到N级」=> ('door'|'bed'|其他名字, N)"""
-    m = re.search(r"前置\s*[:：;；]?\s*(\d{1,2})\s*级\s*(大门|床铺|[^\s|]{1,4})", text)
-    if m:
-        n, what = int(m.group(1)), m.group(2)
-    else:
-        m = re.search(r"(大门|床铺)达到\s*(\d{1,2})\s*级", text)
-        if not m:
-            return None
-        what, n = m.group(1), int(m.group(2))
-    return ({"大门": "door", "床铺": "bed"}.get(what, what), n)
-
-
-ARROW_SZ = 18
-_ARROW = {}
-
-
-def find_arrows(img, y0=0.48, y1=0.86, thr=28):
-    """房间里的绿色「可升级」箭头圆圈（只有现在能升级的建筑才有）。模板 arrow_tpl.png（391 宽画布上 18x18），
-    圆形掩膜比较，箭头 ≤22、其他 ≥37。返回 [(fx, fy, score)]"""
-    if "tpl" not in _ARROW:
-        try:
-            _ARROW["tpl"] = Image.open(os.path.join(HERE, "arrow_tpl.png")).convert("RGB")
-            m = Image.new("L", (ARROW_SZ, ARROW_SZ), 0)
-            ImageDraw.Draw(m).ellipse((3, 3, ARROW_SZ - 4, ARROW_SZ - 4), fill=255)
-            _ARROW["mask"] = m
-        except Exception as e:
-            log(f"箭头模板加载失败: {e}")
-            _ARROW["tpl"] = None
-    tpl, mask = _ARROW.get("tpl"), _ARROW.get("mask")
-    if tpl is None:
-        return []
-    W, H = img.size
-    sm = img.convert("RGB").resize((391, int(391 * H / W))); w, h = sm.size; px = sm.load(); r2 = ARROW_SZ // 2
-
-    def score(cx, cy):
-        c = sm.crop((cx - r2, cy - r2, cx + r2, cy + r2))
-        return sum(ImageStat.Stat(ImageChops.difference(c, tpl), mask).mean) / 3
-    cands = set()
-    for y in range(int(y0 * h), int(y1 * h), 2):
-        for x in range(r2, w - r2, 2):
-            r, g, b = px[x, y]
-            if g >= 180 and g - r >= 50 and -8 <= b - r <= 25:   # 箭头浅绿环
-                for dx in (-4, 0, 4):
-                    for dy in (-4, 0, 4):
-                        cands.add((x + dx, y + dy))
-    scored = sorted((score(cx, cy), cx, cy) for cx, cy in cands)
-    refined = []
-    for sc, cx, cy in scored:                          # 粗筛 < 40 的点再逐像素细化 ±3
-        if sc > 40:
-            break
-        if any(abs(cx - o[1]) <= 6 and abs(cy - o[2]) <= 6 for o in refined):
-            continue
-        refined.append(min((score(x, y), x, y) for x in range(cx - 3, cx + 4) for y in range(cy - 3, cy + 4)))
-    out = []
-    for sc, cx, cy in sorted(refined):
-        if sc > thr:
-            break
-        if all(abs(cx - o[0]) > 10 or abs(cy - o[1]) > 10 for o in out):
-            out.append((cx, cy, sc))
-    return [(round(x / w, 3), round(y / h, 3), round(sc, 1)) for x, y, sc in out]
+    """床的位置每关不同：按 OCR「N级」标签找（识别逻辑在 vision.py，这里排除本关发电机的标签）"""
+    return vision.find_bed(texts, BATTLE.get("gen_labels", []))
 
 
 def pick_arrow(target, arrows):
@@ -404,22 +337,6 @@ def pick_arrow(target, arrows):
     return min(c, key=lambda a: (a[0] - 0.72) ** 2 + (a[1] - 0.76) ** 2)[:2] if c else None
 
 
-def find_door(texts, img=None):
-    """门在房间上墙，左侧有「N级」标签，右边是绿色血条；点标签右下的绿色箭头圆圈打开城门面板。
-    OCR 认不出小字「N级」时（后台截图常见），改用绿色血条定位：箭头在血条左端右下方。"""
-    best = None
-    for t, x, y in texts:
-        if re.fullmatch(r"\d{1,2}级[0O口■|\d\s【\[]*", t.strip()) and 0.45 <= y <= 0.68 and x < 0.5:
-            if best is None or y < best[1]:
-                best = (x, y)
-    if best is not None:
-        return (best[0] + 0.063, best[1] + 0.022)      # 标签右侧的绿色箭头圆圈
-    g = door_bar_locate(img) if img is not None else None
-    if g and g["x0"] < 0.6:
-        return (round(g["x0"] + 0.034, 3), round((g["y0"] + g["y1"]) / 2 + 0.022, 3))
-    return None
-
-
 # ---------------- 门血条 / 防守模式（patch23）----------------
 # 门左边「N级」标签右侧的亮绿色分段血条：每秒在战斗画面上读一次绿色格子的列数（391 宽缩略图上）。
 # 记录本关最高值；中位数连续 2 次低于最高值的 90% => 门在挨打 => 防守模式：钱够（召唤价格不是红色）
@@ -432,64 +349,6 @@ DEF_REDROP = 0.06            # 因“不再掉血”退出后，要再掉这么�
 DEF_GAP = 3.0                # 防守召唤间隔（秒，从上一次选卡结束算）
 DEF_FAIL_GAP = 10.0          # 召唤后没出选卡界面/选卡没关 => 缓 10 秒再试
 DOOR_READ_EVERY = 1.0        # 读血条间隔（秒）
-DB_W = 391
-
-
-def _dbar_seg(p):
-    r, g, b = p[:3]
-    # 血条格子：旧整屏截图 (117,252,105)，后台 Chrome 截图 (0,255,79)（颜色空间不同）。
-    # 「N级」字 (4,223,127)、箭头环 (100,202,122) 的蓝色都偏高，不满足
-    return g >= 200 and g - r >= 100 and b <= max(r - 4, 0.40 * g)
-
-
-def _dbar_small(img):
-    W, H = img.size
-    return img.convert("RGB").resize((DB_W, int(DB_W * H / W)))
-
-
-def door_bar_locate(img, y0=0.40, y1=0.66, x0=0.02, x1=0.75):
-    """在上墙区域找最长的一段亮绿分段条（≥14 px 宽、≥3 行一致）。返回比例坐标 {x0,x1,y0,y1} 或 None"""
-    sm = _dbar_small(img); w, h = sm.size; px = sm.load()
-    rows = {}
-    for y in range(int(y0 * h), int(y1 * h)):
-        cl, s0, p0 = [], None, None
-        for x in range(int(x0 * w), int(x1 * w)):
-            if not _dbar_seg(px[x, y]):
-                continue
-            if s0 is None:
-                s0 = p0 = x
-            elif x - p0 <= 5:
-                p0 = x
-            else:
-                cl.append((s0, p0)); s0 = p0 = x
-        if s0 is not None:
-            cl.append((s0, p0))
-        rows[y] = [c for c in cl if c[1] - c[0] >= 14]
-    best = None
-    for y, cl in rows.items():
-        for a, b in cl:
-            ys = [yy for yy in range(y - 6, y + 7)
-                  if any(abs(c[0] - a) <= 4 and abs(c[1] - b) <= 4 for c in rows.get(yy, []))]
-            sc = (b - a) * len(ys)
-            if len(ys) >= 3 and (best is None or sc > best[0]):
-                best = (sc, a, b, min(ys), max(ys))
-    if not best:
-        return None
-    _, a, b, ya, yb = best
-    return {"x0": a / w, "x1": b / w, "y0": ya / h, "y1": yb / h}
-
-
-def door_bar_measure(img, g):
-    """已定位的血条范围内，亮绿列数（列中一半以上行是格子绿才算）"""
-    sm = _dbar_small(img); w, h = sm.size; px = sm.load()
-    xa = max(0, int(g["x0"] * w) - 3); xb = min(w - 1, int(g["x1"] * w) + 4)
-    ya = max(0, int(g["y0"] * h)); yb = min(h - 1, int(g["y1"] * h))
-    n = 0
-    for x in range(xa, xb + 1):
-        hit = sum(1 for y in range(ya, yb + 1) if _dbar_seg(px[x, y]))
-        if hit * 2 >= (yb - ya + 1):
-            n += 1
-    return n
 
 
 def _dw():
@@ -647,8 +506,10 @@ def _upgrade(cv, target, btn, name):
         return "已满级"                                 # 床本关已满级，不再点（门满级仍打开面板读血量）
     if not clear_popups(cv):
         return ""
-    arrows = find_arrows(cv.grab())
+    aimg = cv.grab()
+    arrows = find_arrows(aimg)
     pos = pick_arrow(target, arrows)
+    by_arrow = pos is not None
     if pos is None:                                    # 没有绿色箭头 => 现在升不了（钱/电/前置不够或满级）
         k = target + "_noarrow"
         BATTLE[k] = BATTLE.get(k, 0) + 1
@@ -665,6 +526,8 @@ def _upgrade(cv, target, btn, name):
     panel = ocr_join(tp, 0.3, 0.75)                    # 面板文字（等级/花费/提示）
     if PANEL_KEY[target] in panel and pos:
         BATTLE[target + "_pos"] = pos                  # 记住这关的床/门位置
+        if by_arrow and not vision.has_cdp_template() and vision.save_arrow_template(aimg, pos):
+            log(f"已在后台浏览器画面里采集箭头模板（{target} 箭头 {pos}），之后箭头识别更准")
     elif target == "bed" and pos and pos[1] >= 0.64:
         BATTLE.setdefault("not_bed", []).append(pos)   # 这个箭头不是床（可能是发电机）
     if PANEL_KEY[target] not in panel:
@@ -1157,6 +1020,7 @@ def write_alert(reason, shot="", texts=None):
         f.write(f"shot={shot or ''}\n")
         f.write(f"ocr={ocr_join(texts or [])[:300]}\n")
     log(f"!!! 写入 ALERT：{reason}")
+    notify.notify(f"第 {BATTLE.get('level')} 关：{reason}", title="妖怪金手指 需要处理")
 
 
 def start_monitor(cv):
@@ -1426,6 +1290,23 @@ def battle_round(cv, n, t0, summon_every):
     log(f"战斗进行中……第 {BATTLE['level']} 关，已 {int(time.time() - t0)} 秒，金币 {coins}，召唤 {BATTLE['summons']} 次{dbs}")
 
 
+def restore_battle_fullscreen(cv):
+    """战斗中游戏掉回淘宝网页小窗口（14:06 第 69 关）：点网页「全屏」，等画面回来，还在战斗就接着打。返回是否恢复成功"""
+    log("战斗中游戏掉回网页小窗口，点「全屏」恢复")
+    if not restore_fullscreen(tries=2, activate=False, quiet=True):
+        return False
+    cv.autocalib("战斗中恢复全屏")
+    for _ in range(10):
+        sleep(1)
+        if cv.in_battle():
+            PAGE.update(kind=None)
+            _EMB["t"] = 0.0
+            log("已恢复全屏，继续本关战斗")
+            event("fullscreen_restored", cv)
+            return True
+    return False
+
+
 def wait_battle(cv, t0, summon_every=SUMMON_EVERY):
     """战斗主循环：每 1 s 看一眼暂停按钮；弹窗（转盘等）立刻点空白关闭；结算画面立刻返回。"""
     n = 0
@@ -1456,11 +1337,15 @@ def wait_battle(cv, t0, summon_every=SUMMON_EVERY):
             door_watch(cv, img)                        # 门血条 + 防守模式召唤
             continue
         # 暂停按钮不见了：转盘/掉落弹窗，或者结算画面
+        if embedded_page([]) and restore_battle_fullscreen(cv):
+            continue                                   # 战斗中掉回网页小窗口 => 点「全屏」接着打（不作废本关）
         texts = cv.ocr(img, tag="poll")
         if popup_t is None:
             popup_t = time.time()
             pop_ev = texts                             # patch26：事件/截图挪到点完之后（弹窗期间游戏暂停，先关弹窗）
-        if page_bad():                                 # 标签页崩溃 / 掉回淘宝网页小窗口 => 本关作废（crash，不算失败）
+        if page_bad() and PAGE["kind"] == "page" and restore_battle_fullscreen(cv):
+            continue
+        if page_bad():                                 # 标签页崩溃 / 全屏恢复不了 => 本关作废（crash，不算失败）
             r = end_battle(cv, texts, f"战斗中网页异常（{PAGE['kind']}），本关记为 crash")
             page_recover(cv, "战斗中网页异常")
             return r
@@ -1836,25 +1721,37 @@ def soft_clear(cv, steps=3):
 
 def wait_loaded(cv, timeout=LOAD_WAIT):
     """重载/全屏后等游戏真正加载完（游戏界面出现，最多 timeout 秒）。期间：看到网页「全屏」就点，看到推广弹窗就关。绝不重载。"""
-    t0 = time.time(); i = 0
+    t0 = time.time(); i = 0; same = 0; last_j = None; next_diag = t0 + 15
     _VIS["block_until"] = 0
     log(f"等待游戏加载完成（最多 {timeout:.0f} 秒，期间不重载）")
     while time.time() - t0 < timeout and not STOP.is_set():
         i += 1
         if not game_visible(0):
-            sleep(3); continue
+            sleep(1.5); continue
         img = cv.grab(); texts = cv.ocr(img, tag="load")
         emb = embedded_page(texts)
-        if (emb or i % 3 == 1) and restore_fullscreen(tries=1, activate=False, quiet=True):
-            cv.autocalib("全屏后"); continue           # 嵌入式布局 => 点「全屏」（restore_fullscreen 内已等 4 秒）
+        if emb and restore_fullscreen(tries=1, activate=False, quiet=True):
+            cv.autocalib("全屏后"); continue           # 嵌入式布局 => 点「全屏」（先看 DOM，已全屏时立刻返回）
         if emb:
-            sleep(3); continue                         # 网页布局但「全屏」还没出现：只等，不点
-        if is_promo(texts, cv.screen(img)):
+            sleep(1.5); continue                       # 网页布局但「全屏」还没出现：只等，不点
+        sc = cv.screen(img)
+        if is_promo(texts, sc):
             handle_promo(cv, img, texts); continue
         if game_ui(cv, img, texts):
             log(f"游戏已加载（等了 {time.time() - t0:.0f} 秒）")
             return True
-        sleep(3)
+        j = ocr_join(texts)
+        # 画面上是游戏里的文字（不是加载进度）且连续 2 次一样 => 已加载，交给导航流程识别（奖励弹窗等）
+        loading = not texts or re.search(r"加载|载入|%|正在|连接|Loading", j)
+        same = same + 1 if (not loading and j[:40] == last_j) else 0
+        last_j = j[:40]
+        if same >= 1:
+            log(f"游戏画面已稳定（等了 {time.time() - t0:.0f} 秒，界面 {sc}），交给导航流程处理。[画面文字] {j[:80]}")
+            return True
+        if time.time() >= next_diag:                   # 每 15 秒留一行诊断，方便以后查「为什么等这么久」
+            next_diag = time.time() + 15
+            log(f"  仍在等加载（{time.time() - t0:.0f} 秒）：界面 {sc}，DOM {BR.fullscreen_state()}，[画面文字] {j[:80] or '（无）'}")
+        sleep(1.5)
     log(f"等了 {time.time() - t0:.0f} 秒，游戏仍未加载完成")
     return False
 
@@ -1909,7 +1806,6 @@ def level_fallback(texts=None, st=None):
 
 def restore_fullscreen(tries=8, activate=True, quiet=False):
     """页面重新加载后游戏会回到嵌在淘宝游戏中心里的小窗口：找网页上的「全屏」按钮点一下，恢复黑底大画布（calib 依赖此布局）。"""
-    exe = os.path.join(HERE, "ocr")
     if not game_visible(0):
         return False                                   # 后台 Chrome 不在游戏页：不点
     for i in range(tries):
@@ -1923,7 +1819,7 @@ def restore_fullscreen(tries=8, activate=True, quiet=False):
                 BR.click(cx, cy); sleep(4); return True
             sw, sh = BR.size()                         # DOM 没找到 => 整页截图 OCR 兜底
             path = os.path.join(HERE, "_fs.png"); BR.shot().save(path)
-            out = subprocess.run([exe, path], capture_output=True, text=True, timeout=10).stdout
+            out = ocr_client.ocr_text(path, 10)
             for line in out.splitlines():
                 parts = line.split("\t")
                 tt = parts[0].strip() if len(parts) == 5 else ""
@@ -1961,6 +1857,9 @@ def maybe_reload():
     os.execv(sys.executable, [sys.executable, "-u", path] + args)
 
 
+STOP_FLAG = os.path.join(HERE, "STOP_AFTER_LEVEL")
+
+
 def run(cv, resume=False):
     no_progress = 0
     st = load_state()
@@ -1978,6 +1877,14 @@ def run(cv, resume=False):
         finish_level(cv, st, start, result)
     k = 0
     while k < MAX_LEVELS:                    # 只有真正进入战斗才计场数；进不去就一直恢复重试
+        if os.path.exists(STOP_FLAG):        # 监控页「打完这关再退出」/ stop_bot.py --after-level
+            try:
+                os.remove(STOP_FLAG)
+            except OSError:
+                pass
+            log("收到「打完这关再退出」：本关已结束，关闭后台浏览器并退出（守护不会重启）")
+            cdp_backend.close_browser()
+            return
         tidy_tabs()
         maybe_reload()
         log(f"======== 第 {k + 1} 场（本次运行）========")
@@ -2024,6 +1931,10 @@ def main():
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGHUP, _on_signal)
     calib = load_calib(force="--calib" in args)
+    try:
+        os.remove(STOP_FLAG)                 # 重新启动 = 想继续跑：清掉上次没用掉的「打完这关再退出」
+    except OSError:
+        pass
     try:
         if not cdp_backend.launch():
             log("后台 Chrome 启动失败，脚本退出")

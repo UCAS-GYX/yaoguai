@@ -77,6 +77,7 @@ def stop():
     if not START_LOCK.acquire(blocking=False):
         return 409, "正在启动/退出中，请稍等"
     try:
+        stop_bot.stop_after_level(False)               # 立即退出时顺便清掉「打完这关再退出」
         was, closed = stop_bot.stop_all()              # 只按进程精确结束，不会误杀别的程序
         BR.ws = None
         return 200, ("已停止脚本" if was else "脚本本来就没在运行") + ("，已关闭后台浏览器" if closed else "")
@@ -115,7 +116,20 @@ def tail(name, n, maxbytes=32768):
         return [], None
 
 
+_ST = {"t": 0.0, "v": None}
+_ST_LOCK = threading.Lock()
+
+
 def status():
+    """1 秒缓存：多人同时开监控页时，ps / 读日志 / 问浏览器每秒最多做一次"""
+    with _ST_LOCK:
+        if _ST["v"] is None or time.time() - _ST["t"] >= 1.0:
+            _ST["v"] = _status()
+            _ST["t"] = time.time()
+        return dict(_ST["v"], starting=START_LOCK.locked(), stop_pending=stop_bot.stop_pending())
+
+
+def _status():
     pids = [str(p) for p in cdp_backend.find_pids("yaoguai_bot.py")]
     run, age = tail("run.log", 30)
     levels, _ = tail("levels.log", 8)
@@ -213,7 +227,7 @@ select{font:inherit;padding:5px 8px;border-radius:6px;background:#232730;color:#
 <section aria-live="polite">
 <h1>妖怪金手指 · 后台运行监控</h1>
 <div id="alert" role="alert"></div>
-<div class="ctl"><button id="resume" type="button" disabled>继续执行</button><button id="stop" type="button" class="danger" disabled>退出</button><span id="msg" role="status"></span></div>
+<div class="ctl"><button id="resume" type="button" disabled>继续执行</button><button id="after" type="button" class="sec" disabled>打完这关再退出</button><button id="stop" type="button" class="danger" disabled>立即退出</button><span id="msg" role="status"></span></div>
 <div class="cards">
  <div class="card"><b>脚本</b><span id="run">-</span></div>
  <div class="card"><b>当前关卡</b><span id="level">-</span></div>
@@ -241,10 +255,13 @@ function setButton(s) {
   b.disabled = !s || !s.local || s.running || s.starting;
   b.textContent = !s ? "继续执行" : s.running ? "运行中" : s.starting ? "处理中…" : !s.local ? "继续执行（仅本机可点）" : "继续执行";
   x.disabled = !s || !s.local || s.starting || (!s.running && !s.chrome);
-  x.textContent = s && !s.local ? "退出（仅本机可点）" : "退出";
+  x.textContent = s && !s.local ? "立即退出（仅本机可点）" : "立即退出";
+  const a = $("after");
+  a.disabled = !s || !s.local || s.starting || !s.running;
+  a.textContent = s && s.stop_pending ? "取消「打完这关再退出」" : "打完这关再退出";
 }
 async function act(path, hint) {
-  busy = true; $("resume").disabled = $("stop").disabled = true; $("msg").textContent = hint;
+  busy = true; $("resume").disabled = $("stop").disabled = $("after").disabled = true; $("msg").textContent = hint;
   try {
     const r = await fetch(path, {method: "POST", headers: {"X-Token": TOKEN}});
     $("msg").textContent = (await r.json()).msg;
@@ -253,9 +270,10 @@ async function act(path, hint) {
 }
 $("resume").onclick = () => act("/api/resume", "正在启动（会先拉起后台浏览器，最多约 30 秒）…");
 $("stop").onclick = () => {
-  if (confirm("确定退出？会停止脚本并关闭后台浏览器，当前这一关会中断（记为 crash，不算失败）。之后点「继续执行」会重新开始。"))
+  if (confirm("确定立即退出？会停止脚本并关闭后台浏览器，当前这一关会中断（记为 crash，不算失败）。之后点「继续执行」会重新开始。"))
     act("/api/stop", "正在退出…");
 };
+$("after").onclick = () => act("/api/stop_after", "处理中…");
 const hist = [];
 function drawLoad(L) {
   $("lavg").textContent = "系统负载 " + L.loadavg.join(" / ") + "（" + L.cores + " 核）";
@@ -346,12 +364,17 @@ class Handler(BaseHTTPRequestHandler):
         return bool(k) and hmac.compare_digest(k, KEY)
 
     def do_POST(self):
-        if self.path not in ("/api/resume", "/api/stop"):
+        if self.path not in ("/api/resume", "/api/stop", "/api/stop_after"):
             return self._send(404, "text/plain", b"not found")
         origin = self.headers.get("Origin")
         if (not self._local() or self.headers.get("X-Token") != TOKEN
                 or (origin and origin.split("//")[-1] not in ALLOWED_HOSTS)):
             return self._json(403, "拒绝：「继续执行」「退出」只能在运行脚本的这台电脑上点（页面是旧的就刷新一下）")
+        if self.path == "/api/stop_after":
+            on = not stop_bot.stop_pending()
+            stop_bot.stop_after_level(on)
+            _ST["v"] = None
+            return self._json(200, "已设置：当前这关打完后自动退出（关闭后台浏览器）" if on else "已取消「打完这关再退出」")
         self._json(*(resume() if self.path == "/api/resume" else stop()))
 
     def do_GET(self):

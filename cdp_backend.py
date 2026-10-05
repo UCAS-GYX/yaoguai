@@ -84,7 +84,12 @@ def close_stray_pages():
     tabs = json.load(urllib.request.urlopen(f"http://127.0.0.1:{PORT}/json", timeout=3))
     pages = [t for t in tabs if t.get("type") == "page"]
     stray = [t for t in pages if "taobao.com" not in t.get("url", "")]
-    if not stray or len(stray) == len(pages):
+    if len(stray) == len(pages):
+        return 0
+    # 重复的游戏页也关掉，只留一个（重启浏览器时会恢复上次的标签页，再加上启动参数里的地址 => 两个游戏页同时渲染）
+    game = [t for t in pages if "taobao.com" in t.get("url", "")]
+    stray += game[1:]
+    if not stray:
         return 0
     ws = websocket.create_connection(v["webSocketDebuggerUrl"], suppress_origin=True, timeout=10)
     try:
@@ -97,11 +102,44 @@ def close_stray_pages():
     return len(stray)
 
 
-def replace_page():
-    """游戏页卡死时：通过浏览器级连接新开一个游戏页，再关掉旧页（旧页的渲染进程不响应，页面级连接用不了）。"""
+def close_browser(wait=10):
+    """关闭后台浏览器（整个进程）。返回是否已关闭"""
     v = alive()
     if not v:
-        return
+        return True
+    try:
+        ws = websocket.create_connection(v["webSocketDebuggerUrl"], suppress_origin=True, timeout=10)
+        ws.send(json.dumps({"id": 1, "method": "Browser.close"}))
+        ws.close()
+    except Exception:
+        return False
+    for _ in range(int(wait * 2)):
+        if not alive():
+            return True
+        time.sleep(0.5)
+    return False
+
+
+REPLACE_GAP = 120            # 两次换页至少间隔 2 分钟（新页加载时主线程也很忙，不能一超时就再换 => 循环换页）
+REPLACE_SLOW = 120           # 换页后 2 分钟内，请求超时放宽到 45 秒，耐心等新页加载
+REPLACE_FILE = os.path.join(HERE, ".last_replace")   # 存时间戳：bot 崩溃重启后也记得刚换过页
+
+
+def last_replace():
+    try:
+        return os.path.getmtime(REPLACE_FILE)
+    except OSError:
+        return 0.0
+
+
+def replace_page():
+    """游戏页卡死时：通过浏览器级连接新开一个游戏页，再关掉旧页（旧页的渲染进程不响应，页面级连接用不了）。
+    距上次换页不到 REPLACE_GAP 秒就不换，返回 False。"""
+    v = alive()
+    if not v or time.time() - last_replace() < REPLACE_GAP:
+        return False
+    with open(REPLACE_FILE, "w") as f:
+        f.write(str(time.time()))
     tabs = json.load(urllib.request.urlopen(f"http://127.0.0.1:{PORT}/json", timeout=3))
     old = [t["id"] for t in tabs if t.get("type") == "page"]
     ws = websocket.create_connection(v["webSocketDebuggerUrl"], suppress_origin=True, timeout=10)
@@ -114,6 +152,7 @@ def replace_page():
     finally:
         ws.close()
     print(f"[cdp] 游戏页无响应，已新开游戏页并关闭 {len(old)} 个旧页", flush=True)
+    return True
 
 
 class Browser:
@@ -137,7 +176,8 @@ class Browser:
             raise RuntimeError("后台 Chrome 没有页面")
         page = (next((t for t in pages if "game.taobao.com" in t.get("url", "")), None)
                 or next((t for t in pages if "taobao.com" in t.get("url", "")), pages[0]))
-        self.ws = websocket.create_connection(page["webSocketDebuggerUrl"], suppress_origin=True, timeout=12)
+        slow = time.time() - last_replace() < REPLACE_SLOW    # 刚换过页：新页还在加载，多等一会
+        self.ws = websocket.create_connection(page["webSocketDebuggerUrl"], suppress_origin=True, timeout=45 if slow else 12)
         self._call("Emulation.setFocusEmulationEnabled", enabled=True)
         r = self._call("Runtime.evaluate", expression="[innerWidth, innerHeight, devicePixelRatio]", returnByValue=True)
         self.vw, self.vh, self.dpr = r["result"]["value"]
@@ -154,27 +194,35 @@ class Browser:
                 return m.get("result", {})
 
     def call(self, method, **params):
+        """连接断了重连一次；同一次请求两次都超时（页面卡死：渲染进程 100% CPU、协议不回）=> 立刻换新游戏页再试一次。
+        以前要「同一进程里两次请求都失败」才换页，bot 启动时一超时就崩溃重启、计数清零，15:07 因此反复崩溃 5 次。"""
         with self.lock:
-            for attempt in range(2):
+            timeouts = 0
+            for attempt in range(3):
                 try:
                     if self.ws is None:
                         self._connect()
-                    r = self._call(method, **params)
-                    self.fails = 0
-                    return r
+                    return self._call(method, **params)
                 except CDPError:
                     raise
-                except Exception:
+                except Exception as e:
                     try:
                         self.ws and self.ws.close()
                     except Exception:
                         pass
                     self.ws = None
-                    if attempt:
-                        self.fails = getattr(self, "fails", 0) + 1
-                        if self.fails >= 2 and self.auto:      # 页面卡死（渲染进程 100% CPU、协议不回）=> 换一个新标签页
-                            self.fails = 0
-                            replace_page()
+                    if isinstance(e, (websocket.WebSocketTimeoutException, TimeoutError)):
+                        timeouts += 1
+                    if attempt == 1 and timeouts == 2 and self.auto:
+                        try:
+                            ok = replace_page()
+                        except Exception:
+                            raise e
+                        if not ok:
+                            raise                      # 2 分钟内刚换过页：不再换，交给调用方（下次请求用 45 秒超时等新页）
+                        time.sleep(2)
+                        continue
+                    if attempt >= 1:
                         raise
 
     def size(self):

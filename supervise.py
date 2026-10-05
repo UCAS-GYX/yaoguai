@@ -44,6 +44,12 @@ while True:
         log(f"bot 意外退出（{how}），30 分钟内已重启 {MAX_RESTARTS} 次，不再重启")
         with open(os.path.join(HERE, "ALERT"), "w", encoding="utf-8") as f:
             f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} bot 反复意外退出（{how}），守护已停止，请看 run.log\n")
+        try:
+            import notify
+            notify.notify(f"bot 反复意外退出（{how}），守护已停止", title="妖怪金手指 已停止")
+            time.sleep(3)                              # 通知在后台线程发，等它发完再退出
+        except Exception:
+            pass
         break
     log(f"bot 意外退出（{how}），10 秒后自动重启（--resume）")
     time.sleep(10)
