@@ -74,6 +74,11 @@ class Vision(unittest.TestCase):
         self.assertAlmostEqual(p[0], 0.71); self.assertAlmostEqual(p[1], 0.77)
         self.assertIsNone(vision.find_bed([("3级", 0.73, 0.80)], gen_labels=[(0.73, 0.80)]))
 
+    def test_find_bed_ocr_tail(self):
+        """日志里床标签常被认成「6级：」，以前严格匹配「6级」，没找到床 27%"""
+        self.assertIsNotNone(vision.find_bed([("6级：", 0.73, 0.80)]))
+        self.assertIsNone(vision.find_bed([("1级招财猫", 0.73, 0.80)]))
+
     def test_parse_prereq(self):
         self.assertEqual(vision.parse_prereq("升级 | 前置：8级大门 | 800"), ("door", 8))
         self.assertEqual(vision.parse_prereq("大门达到3级"), ("door", 3))

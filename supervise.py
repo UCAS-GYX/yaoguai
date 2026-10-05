@@ -51,8 +51,9 @@ while True:
         except Exception:
             pass
         break
-    log(f"bot 意外退出（{how}），10 秒后自动重启（--resume）")
-    time.sleep(10)
+    wait = min(120, 10 * 2 ** (len(restarts) - 1))      # 退避：10、20、40、80、120 秒（15:07 曾每 10 秒崩溃重启一次）
+    log(f"bot 意外退出（{how}），{wait} 秒后自动重启（--resume）")
+    time.sleep(wait)
     if "--resume" not in args:
         args = args + ["--resume"]
 log("守护退出")

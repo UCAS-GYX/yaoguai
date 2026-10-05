@@ -566,9 +566,11 @@ def _upgrade(cv, target, btn, name):
         cv.click("blank", 0.4)
         return "前置"
     if target == "door":                               # 门血量「当前/上限」=> 判断是否危险
-        m = re.search(r"(\d{3,6})\s*/\s*(\d{4,6})", panel)
-        if m and int(m.group(2)) > 0:
-            BATTLE["door_hp"] = int(m.group(1)) / int(m.group(2))
+        m = re.search(r"(\d[\d ]{2,7})\s*/\s*(\d{4,6})", panel)   # OCR 会在数字中间插空格：「37 120/37120」
+        if m:
+            cur, top = int(m.group(1).replace(" ", "")), int(m.group(2))
+            if 0 < top and cur <= top:                 # 当前血量大于上限 = 读错了（如「12450/ 2450」），不采用
+                BATTLE["door_hp"] = cur / top
     if "已满级" in panel:
         if not BATTLE.get(target + "_max"):
             log(f"{name}已满级，本关不再点升级")
@@ -1436,7 +1438,7 @@ def wait_battle(cv, t0, summon_every=SUMMON_EVERY):
     return "超时结算"
 
 
-def fast_reclick(cv, tries=3, gap=1.2):
+def fast_reclick(cv, tries=3, gap=0.6):              # 原 1.2：日志里 44 次弹窗有 39 次要点 2 下
     """patch26：点空白后每 0.3 s 只看暂停按钮像素（不 OCR）；gap 秒内没回到战斗且画面上没有结算/选卡迹象 => 再点一次空白。
     数据：145 次弹窗里 103 次要点 2 次（中位 5.8 s，点 1 次的 3.6 s）——第 1 次点在转盘转动中被忽略。返回额外点击次数。"""
     extra = 0
@@ -1621,7 +1623,7 @@ def to_next_battle(cv, st, timeout=150):
             page_recover(cv, "导航中看到网页/崩溃页文字")
             unknown = 0; ladder = 0; sig_t = time.time(); continue
         if texts and embedded_page(texts) and restore_fullscreen(tries=1, activate=False, quiet=True):
-            wait_loaded(cv, 60); cv.autocalib("全屏后")       # patch25：嵌入式小窗口 => 点网页「全屏」，等加载
+            wait_loaded(cv, FS_WAIT); cv.autocalib("全屏后")       # patch25：嵌入式小窗口 => 点网页「全屏」，等加载
             unknown = 0; ladder = 0; sig_t = time.time(); continue
         if not texts and not game_visible():
             continue
@@ -1703,7 +1705,7 @@ def to_next_battle(cv, st, timeout=150):
         if unknown % 4 == 2:
             cv.autocalib("界面识别失败")
         if unknown % 10 == 5 and restore_fullscreen(tries=1, activate=False, quiet=True):
-            wait_loaded(cv, 60); cv.autocalib("全屏后")       # patch25：掉回嵌入式小窗口 => 点网页「全屏」
+            wait_loaded(cv, FS_WAIT); cv.autocalib("全屏后")       # patch25：掉回嵌入式小窗口 => 点网页「全屏」
             unknown = 0; ladder = 0; sig_t = time.time(); continue
         if j[:60] != last_log:
             last_log = j[:60]
@@ -1784,6 +1786,7 @@ def summon_every_for(st):
 PAGE = {"kind": None, "seen": 0.0, "n": 0, "busy": False, "alerted": False, "last_reload": 0.0}
 RELOAD_GAP = 180            # patch25：两次重载标签页至少间隔 3 分钟
 LOAD_WAIT = 120             # patch25：重载后最多等 120 秒让游戏加载完成（期间不再重载）
+FS_WAIT = 30                # 点「全屏」后最多等 30 秒（原 60；日志里成功的加载都在 0–20 秒内，等满 60 秒的 4 次最后都失败了）
 PAGE_WORDS = ("淘宝网首页", "已买到的宝贝", "购物车")
 CRASH_WORDS = ("崩溃啦", "崩溃了", "喔唷，崩溃")
 
@@ -1845,7 +1848,7 @@ def soft_clear(cv, steps=3):
         img = cv.grab(); texts = cv.ocr(img, tag="soft")
         if embedded_page(texts):
             if restore_fullscreen(tries=1, activate=False, quiet=True):
-                wait_loaded(cv, 60); cv.autocalib("全屏后"); continue
+                wait_loaded(cv, FS_WAIT); cv.autocalib("全屏后"); continue
             return False                               # 网页布局：不按画布坐标乱点
         if is_promo(texts, cv.screen(img)):
             handle_promo(cv, img, texts); continue
@@ -1912,7 +1915,7 @@ def page_recover(cv, why, soft_ok=True):
             log("软恢复（关弹窗/遮罩）后看到游戏界面，本次不重载")
             return
         if restore_fullscreen(tries=2):
-            if wait_loaded(cv, 60):
+            if wait_loaded(cv, FS_WAIT):
                 cv.autocalib("全屏后")
                 return
         if kind == "crash" or n >= 2:

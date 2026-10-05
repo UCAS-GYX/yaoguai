@@ -14,7 +14,7 @@ def find_bed(texts, gen_labels=()):
     """床的位置每关不同：找房间下半部的「N级」标签（床下方的等级字），返回点击点。gen_labels=发电机标签位置（排除）"""
     best = None
     for t, x, y in texts:
-        if re.fullmatch(r"\d{1,2}级", t.strip()) and 0.64 <= y <= 0.88:
+        if re.fullmatch(r"\d{1,2}级[：:。.,，\s口■|]*", t.strip()) and 0.64 <= y <= 0.88:   # OCR 常带尾巴：「6级：」
             if any(abs(x - gx) < 0.05 and abs(y - gy) < 0.05 for gx, gy in gen_labels):
                 continue
             d = (x - 0.72) ** 2 + (y - 0.78) ** 2
