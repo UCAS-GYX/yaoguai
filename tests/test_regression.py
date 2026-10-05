@@ -127,6 +127,33 @@ class Texts(unittest.TestCase):
     def test_checkbox_promo(self):
         self.assertTrue(yb.is_promo(T("公会封魔录", "今日不再提示", "前往")))
 
+    def test_build_panel_cat_only(self):
+        """用户截图：发电机满了，面板只剩招财猫 0/1（60 电）。以前把它当成发电机 0 座，一关里点了 100 多次"""
+        t = [("新增建筑", 0.50, 0.37), ("每秒", 0.30, 0.43), ("10", 0.37, 0.43), ("数量:0/1", 0.62, 0.43),
+             ("摸鱼的招财猫，挥手随缘招财", 0.43, 0.46), ("60", 0.83, 0.45), ("1级招财猫", 0.16, 0.48)]
+        rows = yb.parse_build_panel(t)
+        self.assertNotIn("gen", rows)
+        self.assertEqual((rows["cat"]["n"], rows["cat"]["m"]), (0, 1))
+        self.assertEqual(rows["cat"]["btn"], (0.83, 0.45))
+
+    def test_build_panel_two_rows(self):
+        t = [("新增建筑", 0.50, 0.37), ("每秒+1电", 0.30, 0.43), ("数量:1/2", 0.62, 0.43), ("300", 0.82, 0.45),
+             ("1级发电机", 0.16, 0.48), ("每秒", 0.30, 0.52), ("数量:0/1", 0.62, 0.52), ("60", 0.82, 0.54),
+             ("1级招财猫", 0.16, 0.57)]
+        rows = yb.parse_build_panel(t)
+        self.assertEqual((rows["gen"]["n"], rows["gen"]["m"], rows["gen"]["btn"]), (1, 2, (0.82, 0.45)))
+        self.assertEqual((rows["cat"]["n"], rows["cat"]["btn"]), (0, (0.82, 0.54)))
+
+    def test_research_due(self):
+        self.assertFalse(yb.research_due({"last_win": 71, "research_at": 71}))
+        self.assertFalse(yb.research_due({"last_win": 80, "research_at": 71}))
+        self.assertTrue(yb.research_due({"last_win": 81, "research_at": 71}))
+        self.assertFalse(yb.research_due({"last_win": 81, "research_at": 71, "research_try": 81}))   # 同一通关数只试一次
+
+    def test_research_levels(self):
+        t = [("房间研发", 0.50, 0.12), ("52", 0.08, 0.30), ("51", 0.08, 0.43), ("48", 0.08, 0.85), ("键升级", 0.52, 0.96)]
+        self.assertEqual(yb._research_levels(t), [48, 51, 52])
+
     def test_read_level(self):
         self.assertEqual(yb.read_level([("第 64 关", 0.1, 0.1)]), 64)
         self.assertIsNone(yb.read_level([("勞67夫", 0.1, 0.1)]))

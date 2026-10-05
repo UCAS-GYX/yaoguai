@@ -515,6 +515,8 @@ def _upgrade(cv, target, btn, name):
         BATTLE[k] = BATTLE.get(k, 0) + 1
         if BATTLE[k] % 4 != 0:                         # 每 4 次才按旧办法试一次（兜底 + 读门血量）
             return "无箭头"
+        if target == "bed" and BATTLE.get("bed_pos"):
+            return "无箭头"                            # 床位置已知又没箭头 = 现在升不了，盲点只会报「没找到床铺」
         pos = BATTLE.get(target + "_pos")
     else:
         BATTLE[target + "_noarrow"] = 0
@@ -591,14 +593,45 @@ def _upgrade(cv, target, btn, name):
 
 BUILD_TILES = [(0.50, 0.76), (0.27, 0.76), (0.62, 0.70), (0.15, 0.70), (0.39, 0.76), (0.62, 0.76),
                (0.27, 0.70), (0.15, 0.76)]   # 房间地面「+」格子候选（房间布局每关不同，靠 OCR「新增建筑」确认）
-GEN_BUY = (0.80, 0.49)       # 「新增建筑」面板里 1级发电机 的购买按钮（300 金）
+GEN_BUY = (0.80, 0.49)       # OCR 找不到价格按钮时的后备位置（旧版固定坐标）
 MAX_GENS = 2
+BUILD_KINDS = (("gen", ("发电机", "每秒+1电", "发电")), ("cat", ("招财猫", "招财", "摸鱼")))
+BUILD_NAME = {"gen": "发电机", "cat": "招财猫"}
+BUILD_GAP = 45               # 两次打开「新增建筑」至少隔 45 秒（以前一关里点了 100 多次）
 
 
-def build_generator(cv):
-    """点空地格子打开「新增建筑」，买 1 级发电机（300 金，+1 电/秒）。门 6 级以后、床 7 级都要电。"""
-    if BATTLE.get("gens", 0) >= MAX_GENS or not clear_popups(cv):
+def parse_build_panel(texts):
+    """「新增建筑」面板（位置随点的格子变化）：每行 = 名字/说明 + 「数量:n/m」+ 右侧价格按钮。
+    返回 {kind: {"n": n, "m": m, "btn": (x, y) 或 None}}，kind = gen（发电机）/ cat（招财猫）。
+    以前只取第一个「数量」、点固定坐标：发电机满了以后面板只剩招财猫，把它的 0/1 当成发电机，一关里点了 100 多次。"""
+    rows = []
+    for t, x, y in texts:
+        m = re.search(r"数量\s*[:：]?\s*(\d)\s*/\s*(\d)", t.replace(" ", ""))
+        if m:
+            rows.append({"y": y, "n": int(m.group(1)), "m": int(m.group(2)), "kind": None, "btn": None})
+    if not rows:
+        return {}
+    def near(y):                                       # 名字/说明/价格都在本行「数量」那一行或它下面 => 归到上方最近的行
+        above = [r for r in rows if r["y"] <= y + 0.02]
+        return max(above, key=lambda r: r["y"]) if above else min(rows, key=lambda r: abs(r["y"] - y))
+    for t, x, y in texts:
+        r = near(y)
+        if abs(r["y"] - y) > 0.07:
+            continue
+        for kind, words in BUILD_KINDS:
+            if r["kind"] is None and any(w in t for w in words):
+                r["kind"] = kind
+        if x >= 0.68 and re.fullmatch(r"[^\d]{0,2}\d{2,4}", t.strip()) and abs(r["y"] - y) <= 0.04:
+            r["btn"] = (x, y)                          # 价格按钮（300 金 / 60 电）
+    return {r["kind"]: r for r in rows if r["kind"]}
+
+
+def build_room(cv):
+    """点空地格子打开「新增建筑」：先建发电机（300 金，+1 电/秒，每关最多 2 座），满了再建招财猫（60 电，+10 金/秒，1 座）。
+    门 6 级以后、床 7 级都要电。按 OCR 找按钮；全满 / 资源不足就关面板，本关不再反复打开。"""
+    if BATTLE.get("build_done") or time.time() < BATTLE.get("build_next", 0) or not clear_popups(cv):
         return
+    BATTLE["build_next"] = time.time() + BUILD_GAP
     tried = BATTLE.setdefault("bad_tiles", [])
     for tile in BUILD_TILES:
         if tile in tried:
@@ -613,19 +646,39 @@ def build_generator(cv):
             time.sleep(0.6)
             clear_popups(cv)
             continue
-        m = re.search(r"数量[:：]?\s*(\d)\s*/\s*(\d)", j)
-        n = int(m.group(1)) if m else 0
-        if m and n >= int(m.group(2)):
-            BATTLE["gens"] = n; cv.click("blank", 0.6)
-            log(f"发电机已满 {n} 座")
+        rows = parse_build_panel(texts)
+        gen, cat = rows.get("gen"), rows.get("cat")
+        if gen:
+            BATTLE["gens"] = gen["n"]
+        want = (("gen", gen) if gen and gen["n"] < min(gen["m"], MAX_GENS) else
+                ("cat", cat) if cat and cat["n"] < cat["m"] else None)
+        if want is None:
+            BATTLE["build_done"] = True
+            cv.click("blank", 0.6)
+            have = "；".join(f"{BUILD_NAME[k]} {v['n']}/{v['m']}" for k, v in rows.items()) or "面板没认出来"
+            log(f"建筑已满（{have}），本关不再建造。[面板] {j[:100]}")
             return
-        POSITIONS["_b"] = GEN_BUY; cv.click("_b", 1.2)
-        BATTLE["gens"] = n + 1
-        BATTLE.setdefault("gen_labels", []).append((tile[0], tile[1] + 0.04))
+        kind, r = want
+        POSITIONS["_b"] = r["btn"] or (GEN_BUY if kind == "gen" else (GEN_BUY[0], r["y"]))
+        cv.click("_b", 1.2)
+        toast = ocr_join(cv.ocr(tag="build2"))
+        if "不足" in toast:
+            log(f"建造{BUILD_NAME[kind]}：资源不足，{BUILD_GAP} 秒后再试")
+            cv.click("blank", 0.6)
+            return
         tried.append(tile)                             # 这个格子已经有建筑了
-        log(f"建造发电机：格子 {tile}，第 {n + 1} 座")
+        if kind == "gen":
+            BATTLE["gens"] = r["n"] + 1
+            BATTLE.setdefault("gen_labels", []).append((tile[0], tile[1] + 0.04))
+        log(f"建造{BUILD_NAME[kind]}：格子 {tile}，第 {r['n'] + 1}/{r['m']} 座（按钮 {POSITIONS['_b']}）")
+        if "新增建筑" in toast:
+            cv.click("blank", 0.6)
         return
-    log("没有找到能打开「新增建筑」的空格子")
+    BATTLE["build_done"] = True
+    log("没有找到能打开「新增建筑」的空格子，本关不再建造")
+
+
+build_generator = build_room                           # 旧名字（explore 等地方还在用）
 
 
 def door_upgrade(cv):
@@ -1163,11 +1216,13 @@ def pick_card(cv):
     """选卡界面（「请点击选择上方任一选项」，1~3 张卡）：依次试 3 张卡时第 1 张 / 2 张卡时第 1 张 / 1 张卡（居中），
     每点一次都用 OCR 确认选卡界面是否关闭。"""
     t = cv.ocr(tag="pick")
-    if not picker_open(t):
+    for _ in range(3):                                 # 选卡界面有时 2–3 秒才弹出（以前只等 0.6 秒，一天误报 9 次）
+        if picker_open(t):
+            break
         time.sleep(0.6); t = cv.ocr(tag="pick")
-        if not picker_open(t):
-            log("召唤后没看到选卡界面")
-            return False
+    if not picker_open(t):
+        log(f"召唤后没看到选卡界面（等了约 3 秒）。[画面文字] {ocr_join(t, 0.2, 0.95)[:100]}")
+        return False
     order = ["card1", "card2", "card3"]
     first = first_card_slot(t)                         # patch26：按 OCR 卡名定位最左边那张卡（=第一张），先点它
     if first:
@@ -1266,8 +1321,9 @@ def battle_round(cv, n, t0, summon_every):
     if END_SEEN[0]:
         return
     door_stuck = "资源不足" in (dt or "") or (dt == "无箭头" and BATTLE.get("door_lv", 0) >= 6 and not BATTLE.get("door_max"))
-    if AUTO_BUILD and door_stuck and (coins or 0) >= 350:
-        build_generator(cv)
+    gens_full = BATTLE.get("gens", 0) >= MAX_GENS             # 发电机满了 => 有电就建招财猫（+10 金/秒）
+    if AUTO_BUILD and ((door_stuck and (coins or 0) >= 350) or gens_full):
+        build_room(cv)
     hp = BATTLE.get("door_hp", 1.0)
     br = BATTLE.get("dw", {}).get("ratio")
     if br is not None:
@@ -1462,6 +1518,89 @@ def play_battle(cv, t0, opening=True, summon_every=SUMMON_EVERY):
 LINEUP_WORDS = ("同步主队", "预设", "筛选")
 
 
+# ---------------- 房间研发（用户规则：每打 10 关升级 1 次）----------------
+# 15:55 手动实测（1 倍画布比例）：主页底部「主角」(0.58,0.98) → 「房间研发」(0.22,0.64) → 「一键升级」(0.52,0.96)
+# （研发等级 15–20 → 48–52）→ 右下角返回图标 (0.90,0.99) 回到主角页 → 底部「主线」(0.42,0.975) 回主页。
+RESEARCH_EVERY = 10
+R_POS = {"hero_tab": (0.58, 0.98), "research": (0.22, 0.64), "one_key": (0.52, 0.96),
+         "r_back": (0.90, 0.99), "main_tab": (0.42, 0.975)}
+
+
+def research_due(st):
+    w = int(st.get("last_win") or 0)
+    return w > 0 and w - int(st.get("research_at", 0)) >= RESEARCH_EVERY and st.get("research_try") != w
+
+
+def _find(texts, words, y0=0.0, y1=1.0):
+    for t, x, y in texts:
+        if y0 <= y <= y1 and any(w in t for w in words):
+            return (x, y)
+    return None
+
+
+def _tap(cv, pos, wait=2.0, note=""):
+    POSITIONS["_r"] = pos
+    cv.click("_r", wait, note)
+
+
+def _research_levels(texts):
+    """研发面板左侧一列等级数字（x≈0.08）"""
+    return sorted(int(t) for t, x, y in texts if x < 0.15 and 0.2 < y < 0.92 and re.fullmatch(r"\d{1,3}", t.strip()))
+
+
+def _is_home(texts):
+    j = ocr_join(texts)
+    return bool(re.search(r"开始挑战|已通关|请领取奖励", j)) or looks_home(texts)
+
+
+def do_research(cv, st):
+    """主页 → 主角 → 房间研发 → 一键升级 → 右下角返回 → 主线。每个通关数只试一次（失败也不反复点）。"""
+    w = int(st.get("last_win") or 0)
+    st["research_try"] = w; save_state(st)
+    log(f"房间研发：已通关第 {w} 关（上次研发在第 {st.get('research_at', 0)} 关），按规则每 {RESEARCH_EVERY} 关升级一次")
+    t = cv.ocr(tag="research")
+    _tap(cv, _find(t, ("主角", "生角"), 0.93) or R_POS["hero_tab"], 2.5, "房间研发：点底部「主角」")
+    t = cv.ocr(tag="research")
+    p = _find(t, ("房间研发",), 0.5, 0.75)
+    if not p:
+        log(f"房间研发：主角页没找到「房间研发」，放弃本次。[画面文字] {ocr_join(t)[:100]}")
+        _research_back(cv)
+        return False
+    _tap(cv, p, 2.5, "房间研发：点「房间研发」")
+    t = cv.ocr(tag="research")
+    before = _research_levels(t)
+    btn = _find(t, ("一键升级", "键升级", "键开级"), 0.9)
+    if not btn:
+        log(f"房间研发：没找到「一键升级」，放弃本次。[画面文字] {ocr_join(t)[:100]}")
+        _research_back(cv)
+        return False
+    _tap(cv, btn, 2.5, "房间研发：点「一键升级」")
+    t = cv.ocr(tag="research")
+    after = _research_levels(t)
+    toast = ocr_join(t, 0.2, 0.9)
+    log(f"房间研发：一键升级完成，研发等级 {before[:1] + before[-1:]} → {after[:1] + after[-1:]}"
+        + (f"（提示：{toast[:40]}）" if "不足" in toast else ""))
+    st["research_at"] = w; save_state(st)
+    event("research", cv, t, extra=f"win={w} {before[-1:]}->{after[-1:]}")
+    _research_back(cv)
+    return True
+
+
+def _research_back(cv):
+    """研发面板右下角返回图标 → 主角页 → 底部「主线」回主页（最多试 3 次）"""
+    for _ in range(3):
+        t = cv.ocr(tag="research")
+        if _is_home(t):
+            log("房间研发：已回到主页，继续主线挑战")
+            return True
+        if _find(t, ("房间研发",), 0.08, 0.16):        # 还在研发面板（标题在顶部）
+            _tap(cv, R_POS["r_back"], 2.0, "房间研发：点右下角返回")
+            continue
+        _tap(cv, _find(t, ("主线",), 0.93) or R_POS["main_tab"], 2.5, "房间研发：点底部「主线」")
+    log("房间研发：3 次没回到主页，交给导航流程处理")
+    return False
+
+
 def to_next_battle(cv, st, timeout=150):
     """从结算画面/主页/阵容页走到下一场战斗开始。每次只点一下，点完等画面变化再判断。
     返回 True=已进入战斗。阵容页上只点「挑战」。"""
@@ -1547,6 +1686,8 @@ def to_next_battle(cv, st, timeout=150):
         elif ("请领取奖励" in j or "已通关" in j) and chest_clicks < 3:
             chest_clicks += 1
             cv.click("chest", 0.05, "主页（已通关）：点宝箱领通关奖励"); clicked = True
+        elif sc == "home" and research_due(st):
+            do_research(cv, st); unknown = 0; ladder = 0; sig_t = time.time(); continue
         elif sc == "home":
             cv.click("start", 0.05, "主页：点击「开始挑战」"); clicked = True
         elif click_text(cv, texts, ("开始挑战", "继续挑战"), 0.05):

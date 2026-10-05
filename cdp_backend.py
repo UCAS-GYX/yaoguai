@@ -1,6 +1,6 @@
 # 后台 Chrome（DevTools 协议）：截图 / 点击 / 刷新都在网页内部完成，不动真鼠标、不截整屏，游戏可以在无窗口的 Chrome 里跑。
 # 专用配置目录 chrome_bot_profile（和日常用的 Chrome 分开），调试端口只监听 127.0.0.1。
-import base64, io, json, os, subprocess, threading, time, urllib.request
+import base64, io, json, os, signal, subprocess, threading, time, urllib.request
 import websocket
 from PIL import Image
 
@@ -38,6 +38,14 @@ def launch(headless=True):
     """调试端口没起来就启动专用 Chrome（打开游戏页）。返回是否可用。"""
     if alive():
         return True
+    # 不恢复上次的标签页：否则「恢复的游戏页 + 启动参数里的游戏页」两个同时加载，CPU 翻倍，还容易卡死
+    sess = os.path.join(PROFILE, "Default", "Sessions")
+    if os.path.isdir(sess):
+        for f in os.listdir(sess):
+            try:
+                os.remove(os.path.join(sess, f))
+            except OSError:
+                pass
     args = [CHROME, f"--remote-debugging-port={PORT}", f"--user-data-dir={PROFILE}",
             "--no-first-run", "--no-default-browser-check", f"--window-size={WINDOW[0]},{WINDOW[1]}",
             # 2 倍像素用启动参数固定（每个连接各自设 Emulation 覆盖会互相干扰，视口曾被改成 794x1602）
@@ -125,6 +133,17 @@ REPLACE_SLOW = 120           # 换页后 2 分钟内，请求超时放宽到 45 
 REPLACE_FILE = os.path.join(HERE, ".last_replace")   # 存时间戳：bot 崩溃重启后也记得刚换过页
 
 
+def renderer_pids():
+    """后台浏览器（本项目专用配置目录）的渲染进程。只匹配带 --user-data-dir=PROFILE 和 --type=renderer 的进程，不碰日常 Chrome"""
+    out = subprocess.run(["ps", "-axo", "pid=,args="], capture_output=True, text=True).stdout
+    pids = []
+    for line in out.splitlines():
+        p = line.split(None, 1)
+        if len(p) == 2 and "--type=renderer" in p[1] and f"--user-data-dir={PROFILE}" in p[1]:
+            pids.append(int(p[0]))
+    return pids
+
+
 def last_replace():
     try:
         return os.path.getmtime(REPLACE_FILE)
@@ -132,27 +151,34 @@ def last_replace():
         return 0.0
 
 
+def browser_main_pids():
+    """后台浏览器主进程（本项目专用配置目录、不带 --type= 的那个）"""
+    out = subprocess.run(["ps", "-axo", "pid=,args="], capture_output=True, text=True).stdout
+    return [int(p[0]) for p in (l.split(None, 1) for l in out.splitlines())
+            if len(p) == 2 and f"--user-data-dir={PROFILE}" in p[1] and "--type=" not in p[1]]
+
+
 def replace_page():
-    """游戏页卡死时：通过浏览器级连接新开一个游戏页，再关掉旧页（旧页的渲染进程不响应，页面级连接用不了）。
-    距上次换页不到 REPLACE_GAP 秒就不换，返回 False。"""
-    v = alive()
-    if not v or time.time() - last_replace() < REPLACE_GAP:
+    """游戏页卡死时：整个后台浏览器重启（登录信息在配置目录里，不会丢；启动前清掉上次的标签页记录）。
+    15:45 实测：只换标签页没用，新页会复用卡住的渲染进程；杀渲染进程后恢复的页面也一直不响应；
+    整个浏览器关掉重开（不恢复旧标签页）5 秒就正常。距上次重启不到 REPLACE_GAP 秒就不做，返回 False。"""
+    if not alive() or time.time() - last_replace() < REPLACE_GAP:
         return False
     with open(REPLACE_FILE, "w") as f:
         f.write(str(time.time()))
-    tabs = json.load(urllib.request.urlopen(f"http://127.0.0.1:{PORT}/json", timeout=3))
-    old = [t["id"] for t in tabs if t.get("type") == "page"]
-    ws = websocket.create_connection(v["webSocketDebuggerUrl"], suppress_origin=True, timeout=10)
-    try:
-        msgs = [("Target.createTarget", {"url": GAME_URL})] + [("Target.closeTarget", {"targetId": i}) for i in old]
-        for n, (m, p) in enumerate(msgs, 1):
-            ws.send(json.dumps({"id": n, "method": m, "params": p}))
-            while json.loads(ws.recv()).get("id") != n:
+    if not close_browser(wait=8):                      # 正常关不掉 => 结束主进程（只匹配本项目的配置目录）
+        for pid in browser_main_pids():
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
                 pass
-    finally:
-        ws.close()
-    print(f"[cdp] 游戏页无响应，已新开游戏页并关闭 {len(old)} 个旧页", flush=True)
-    return True
+        for _ in range(10):
+            if not alive():
+                break
+            time.sleep(0.5)
+    ok = launch()
+    print(f"[cdp] 游戏页无响应，已重启后台浏览器（{'成功' if ok else '失败'}）", flush=True)
+    return ok
 
 
 class Browser:
