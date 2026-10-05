@@ -158,12 +158,29 @@ def browser_main_pids():
             if len(p) == 2 and f"--user-data-dir={PROFILE}" in p[1] and "--type=" not in p[1]]
 
 
+def renderer_stats():
+    """后台浏览器渲染进程里最大的 (CPU%, 内存MB)。游戏页跑久了会越来越重（16:50 实测 97 分钟后 202% / 2.8 GB）"""
+    pids = renderer_pids()
+    if not pids:
+        return 0.0, 0
+    out = subprocess.run(["ps", "-o", "pcpu=,rss=", "-p", ",".join(map(str, pids))], capture_output=True, text=True).stdout
+    vals = [(float(a), int(b) // 1024) for a, b in (l.split() for l in out.splitlines() if len(l.split()) == 2)]
+    return (max(v[0] for v in vals), max(v[1] for v in vals)) if vals else (0.0, 0)
+
+
 def replace_page():
     """游戏页卡死时：整个后台浏览器重启（登录信息在配置目录里，不会丢；启动前清掉上次的标签页记录）。
     15:45 实测：只换标签页没用，新页会复用卡住的渲染进程；杀渲染进程后恢复的页面也一直不响应；
     整个浏览器关掉重开（不恢复旧标签页）5 秒就正常。距上次重启不到 REPLACE_GAP 秒就不做，返回 False。"""
     if not alive() or time.time() - last_replace() < REPLACE_GAP:
         return False
+    ok = restart_browser()
+    print(f"[cdp] 游戏页无响应，已重启后台浏览器（{'成功' if ok else '失败'}）", flush=True)
+    return ok
+
+
+def restart_browser():
+    """关掉并重新打开后台浏览器（不恢复旧标签页）。卡死恢复和「每 N 关定期重启降 CPU」都用它"""
     with open(REPLACE_FILE, "w") as f:
         f.write(str(time.time()))
     if not close_browser(wait=8):                      # 正常关不掉 => 结束主进程（只匹配本项目的配置目录）
@@ -176,9 +193,7 @@ def replace_page():
             if not alive():
                 break
             time.sleep(0.5)
-    ok = launch()
-    print(f"[cdp] 游戏页无响应，已重启后台浏览器（{'成功' if ok else '失败'}）", flush=True)
-    return ok
+    return launch()
 
 
 class Browser:

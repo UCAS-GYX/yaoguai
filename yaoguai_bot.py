@@ -66,7 +66,10 @@ MAX_NO_PROGRESS = 3         # 连续多少次“无进展”（点击后画面�
 PERIODIC_SUMMON = "auto"    # patch26："always"=旧行为（每 SUMMON_EVERY 轮召唤一次）；"auto"=只有本关失败过 / 门掉过血 / 进过防守模式才周期召唤
                             #          （用户规则：简单关卡只召唤 3~4 次，其余靠升床/升门；门血<50% 和防守模式的额外召唤不受影响）
 FAST_POPUP = True           # patch26：战斗中弹窗（精英掉落转盘等，游戏暂停中）点空白后用像素快速轮询，1.2 s 没关再点一次，不再等 OCR
-SPEED_2X = False            # patch26：左上「X1」倍速按钮。默认关闭！只有用户确认它免费（不是月卡/充值）后才打开
+SPEED_2X = False            # 左上「X1」倍速按钮：用户 16:50 确认不是免费的 => 永远不要点
+IDLE_COINS = 2000           # 金币 ≥ 2000 时每轮额外召唤 1 次（≥ 8000 召唤 2 次）；价格变红时 summon() 会自己跳过
+RESTART_EVERY = 5           # 每打完 5 关重启一次后台浏览器（游戏页越跑越重：97 分钟后渲染进程 202% CPU / 2.8 GB）
+RESTART_RSS_MB = 1800       # 没到 5 关但渲染进程内存超过 1.8 GB 也重启
 SPEED_POS = (0.069, 0.304)  # 「X1」按钮位置（暂停按钮正下方）
 CALIB_FILE = "calib_cdp.json"   # CDP 版：画布位置是网页内 CSS 像素（旧版整屏坐标在 calib.json，不再使用）
 LOG_FILE = "battle_log.csv"
@@ -1339,6 +1342,13 @@ def battle_round(cv, n, t0, summon_every):
     elif hp < 0.5:                                     # 门血不到一半 => 额外召唤
         log(f"门血量 {hp:.0%}，额外召唤一次")
         summon(cv)
+    elif (coins or 0) >= IDLE_COINS:                   # 用户 16:50：召唤次数放宽。日志里后期金币闲置 1.6–3 万、整关只召唤 4 次
+        k = 2 if coins >= IDLE_COINS * 4 else 1
+        log(f"金币 {coins} 闲置（≥ {IDLE_COINS}），额外召唤 {k} 次")
+        for _ in range(k):
+            if END_SEEN[0]:
+                break
+            summon(cv)
     if END_SEEN[0]:
         return
     if os.path.exists(os.path.join(HERE, "explore_build")):
@@ -1743,6 +1753,7 @@ def write_log(row):
 def finish_level(cv, st, start, result):
     """记录一关的结果；同一关失败 5 次则停止"""
     lv = BATTLE["level"]
+    BROWSER_LEVELS[0] += 1                             # 定期重启后台浏览器用
     dw = BATTLE.get("dw", {})
     if dw.get("mode"):
         _def_stop(dw, "战斗结束")
@@ -2031,6 +2042,7 @@ def run(cv, resume=False):
             return
         tidy_tabs()
         maybe_reload()
+        periodic_restart()
         log(f"======== 第 {k + 1} 场（本次运行）========")
         reset_battle(None)
         if not to_next_battle(cv, st):
@@ -2051,6 +2063,27 @@ def run(cv, resume=False):
         result = play_battle(cv, t0, summon_every=summon_every_for(st))
         finish_level(cv, st, start, result)
     log(f"已达到最大场数 {MAX_LEVELS}，脚本结束。")
+
+
+BROWSER_LEVELS = [0]        # 当前这个后台浏览器打了几关（finish_level 后 +1）
+
+
+def periodic_restart():
+    """关卡间隙：打满 RESTART_EVERY 关，或渲染进程内存超过 RESTART_RSS_MB，就重启后台浏览器（约 10–30 秒，登录不丢）"""
+    cpu, mb = cdp_backend.renderer_stats()
+    why = (f"已打 {BROWSER_LEVELS[0]} 关" if BROWSER_LEVELS[0] >= RESTART_EVERY else
+           f"渲染进程内存 {mb} MB" if mb >= RESTART_RSS_MB else None)
+    if not why:
+        if BROWSER_LEVELS[0]:
+            log(f"后台浏览器负载：渲染进程 CPU {cpu:.0f}%、内存 {mb} MB（已打 {BROWSER_LEVELS[0]} 关，满 {RESTART_EVERY} 关重启）")
+        return
+    log(f"定期重启后台浏览器（{why}，CPU {cpu:.0f}%）降负载……")
+    ok = cdp_backend.restart_browser()
+    BR.ws = None
+    _EMB["t"] = 0.0
+    BROWSER_LEVELS[0] = 0
+    log("后台浏览器已重启，接着走「全屏 → 主页 → 开始挑战」" if ok else "后台浏览器重启失败，交给页面恢复流程")
+    sleep(3)
 
 
 def tidy_tabs():
