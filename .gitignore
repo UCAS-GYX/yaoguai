@@ -1,0 +1,28 @@
+# 运行环境 / 浏览器（体积大、含登录信息）
+venv/
+__pycache__/
+chrome-cft/
+chrome_bot_profile/
+chrome_cft_profile/
+
+# 运行时生成：日志、截图、状态、校准
+*.log
+battle_log.csv
+shots/
+state.json
+calib.json
+calib_cdp.json
+ALERT
+STOP_AFTER_LEVEL
+_*.png
+后台截图_*.png
+
+# 本机私密配置（局域网访问码、飞书 webhook）
+monitor_key.txt
+notify_webhook.txt
+
+# 归档（旧版本、调试截图、安装包）
+_archive/
+
+# 编译产物（源码 ocr.swift 已提交，用 swiftc -O ocr.swift -o ocr 重新编译）
+ocr
