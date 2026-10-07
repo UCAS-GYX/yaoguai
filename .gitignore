@@ -27,3 +27,8 @@ _archive/
 # 编译产物（源码 ocr.swift 已提交，用 swiftc -O ocr.swift -o ocr 重新编译）
 ocr
 .last_replace
+lab_clips/
+
+# 本地状态备份 / 临时
+state_*.json
+.last_hang

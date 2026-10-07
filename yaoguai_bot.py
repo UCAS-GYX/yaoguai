@@ -1973,6 +1973,7 @@ def to_next_battle(cv, st, timeout=150):
     返回 True=已进入战斗。阵容页上只点「挑战」。"""
     t_start = time.time()
     chest_clicks, unknown, last_log, ladder = 0, 0, "", 0
+    chest_t = 0.0
     last_sig, sig_t = None, time.time()
     while time.time() - t_start < timeout:
         wait_game_visible()
@@ -2050,10 +2051,14 @@ def to_next_battle(cv, st, timeout=150):
             clicked = click_text(cv, texts, ("返回",), 0.05)          # 结算画面 => 返回
         elif "恭喜获得" in j:
             cv.click("nav_blank", 0.05, "奖励弹窗：点空白关闭"); clicked = True
-        elif ("请领取奖励" in j or "已通关" in j) and chest_clicks < 6:
-            chest_clicks += 1
-            if chest_clicks % 2:                       # 宝箱图标 / 底部「已通关 请领取奖励」按钮轮流点（17:49 重启后点宝箱没反应，卡了 2 分钟）
-                cv.click("chest", 0.05, "主页（已通关）：点宝箱领通关奖励")
+        elif "请领取奖励" in j or "已通关" in j:
+            # 20:13 实测：浏览器刚重启时游戏还没准备好，1–2 秒内连点 5 次都没反应，旧版点满 6 次就再也不点、卡在主页；
+            # 20:17 手动等 3 秒再点宝箱就弹出「恭喜获得」。所以改成每 4 秒点一次、不设上限（真卡住由看门狗处理）
+            if time.time() - chest_t < 4:
+                sleep(0.5); continue
+            chest_t = time.time(); chest_clicks += 1
+            if chest_clicks % 3:                       # 主要点宝箱图标，每第 3 次改点底部「已通关 请领取奖励」按钮
+                cv.click("chest", 0.05, f"主页（已通关）：点宝箱领通关奖励（第 {chest_clicks} 次）")
             else:
                 POSITIONS["_c"] = _find(texts, ("请领取奖励", "已通关"), 0.8) or POSITIONS["start"]
                 cv.click("_c", 0.05, f"主页（已通关）：点「已通关 请领取奖励」按钮 {POSITIONS['_c']}")

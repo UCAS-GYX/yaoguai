@@ -174,13 +174,40 @@ def replace_page():
     整个浏览器关掉重开（不恢复旧标签页）5 秒就正常。距上次重启不到 REPLACE_GAP 秒就不做，返回 False。"""
     if not alive() or time.time() - last_replace() < REPLACE_GAP:
         return False
-    ok = restart_browser()
-    print(f"[cdp] 游戏页无响应，已重启后台浏览器（{'成功' if ok else '失败'}）", flush=True)
+    try:
+        prev = os.path.getmtime(HANG_FILE)
+    except OSError:
+        prev = 0.0
+    with open(HANG_FILE, "w") as f:
+        f.write(str(time.time()))
+    # 10-06 实测：缓存坏了时每次重启都卡（渲染进程 3 GB、CPU 60–90%），清缓存后正常。连续卡死 => 重启时清缓存
+    clear = time.time() - prev < HANG_CLEAR_WINDOW
+    ok = restart_browser(clear=clear)
+    print(f"[cdp] 游戏页无响应，已重启后台浏览器{'并清缓存' if clear else ''}（{'成功' if ok else '失败'}）", flush=True)
     return ok
 
 
-def restart_browser():
-    """关掉并重新打开后台浏览器（不恢复旧标签页）。卡死恢复和「每 N 关定期重启降 CPU」都用它"""
+HANG_FILE = os.path.join(HERE, ".last_hang")
+HANG_CLEAR_WINDOW = 900      # 15 分钟内第二次卡死就清缓存
+# 只删缓存，不动 Cookies / Local Storage（登录信息在那里）
+CACHE_DIRS = ["Cache", "Code Cache", "GPUCache", "DawnGraphiteCache", "DawnWebGPUCache",
+              os.path.join("Service Worker", "CacheStorage"), os.path.join("Service Worker", "ScriptCache")]
+
+
+def clear_cache():
+    """浏览器关闭后调用：删除配置目录里的缓存文件夹。返回删掉的个数"""
+    import shutil
+    n = 0
+    for d in [os.path.join(PROFILE, "Default", c) for c in CACHE_DIRS] + \
+             [os.path.join(PROFILE, c) for c in ("GrShaderCache", "ShaderCache", "GraphiteDawnCache")]:
+        if os.path.isdir(d):
+            shutil.rmtree(d, ignore_errors=True)
+            n += 1
+    return n
+
+
+def restart_browser(clear=False):
+    """关掉并重新打开后台浏览器（不恢复旧标签页）。卡死恢复和「每 N 关定期重启降 CPU」都用它。clear=True 时关闭后清缓存"""
     with open(REPLACE_FILE, "w") as f:
         f.write(str(time.time()))
     if not close_browser(wait=8):                      # 正常关不掉 => 结束主进程（只匹配本项目的配置目录）
@@ -193,6 +220,9 @@ def restart_browser():
             if not alive():
                 break
             time.sleep(0.5)
+    if clear:
+        time.sleep(1)                                  # 等子进程退干净再删文件
+        print(f"[cdp] 已清理缓存目录 {clear_cache()} 个", flush=True)
     return launch()
 
 
